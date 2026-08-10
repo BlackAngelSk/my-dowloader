@@ -65,6 +65,23 @@ class SettingsPanel(QWidget):
         theme_group.setLayout(theme_form)
         root.addWidget(theme_group)
 
+        # ── Updates group ──────────────────────────────────────
+        update_group = QGroupBox("Updates")
+        update_layout = QHBoxLayout()
+
+        from omnidownloader import __version__
+        self._version_label = QLabel(f"OmniDownloader v{__version__}")
+        self._version_label.setStyleSheet("font-weight: bold;")
+        update_layout.addWidget(self._version_label)
+        update_layout.addStretch()
+
+        self._check_update_btn = QPushButton("Check for Updates")
+        self._check_update_btn.setObjectName("primaryButton")
+        update_layout.addWidget(self._check_update_btn)
+
+        update_group.setLayout(update_layout)
+        root.addWidget(update_group)
+
         # ── Buttons ──────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.addStretch()

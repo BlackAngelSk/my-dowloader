@@ -1,0 +1,102 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g. v0.2.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller packaging
+          pip install -e .
+
+      - name: Extract version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build PyInstaller bundle
+        run: pyinstaller build\windows.spec --noconfirm --clean
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Build installer
+        env:
+          APP_VERSION: ${{ steps.version.outputs.tag }}
+        run: |
+          $issPath = "build\installer.iss"
+          $version = $env:APP_VERSION -replace '^v', ''
+          (Get-Content $issPath) -replace '#define MyAppVersion GetEnv\("APP_VERSION"\)', "#define MyAppVersion `"$version`"" | Set-Content $issPath
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAPP_VERSION=$version build\installer.iss
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OmniDownloader-Windows-${{ steps.version.outputs.tag }}
+          path: dist\OmniDownloader-Setup-*.exe
+
+  create-release:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: OmniDownloader-Windows-${{ steps.version.outputs.tag }}
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: OmniDownloader ${{ steps.version.outputs.tag }}
+          body: |
+            ## OmniDownloader ${{ steps.version.outputs.tag }}
+
+            ### Windows Installer
+            Download `OmniDownloader-Setup-${{ steps.version.outputs.tag }}.exe` below.
+
+            ### Changes
+            <!-- Add changelog here -->
+          files: artifacts/OmniDownloader-Setup-*.exe
+          draft: false
+          prerelease: false

@@ -98,6 +98,35 @@ def main() -> None:
     window = MainWindow(dm)
     window.show()
 
+    # ── Auto-Update Service ────────────────────────────────────
+    from omnidownloader.services.update_service import UpdateService
+    from omnidownloader.ui.widgets.update_dialog import UpdateDialog
+
+    update_svc = UpdateService(
+        current_version=app.applicationVersion(),
+        parent=window,
+    )
+
+    def _show_update_dialog(info):
+        dialog = UpdateDialog(info, update_svc, parent=window)
+        dialog.download_requested.connect(update_svc.download_update)
+        dialog.install_requested.connect(UpdateService.install_update)
+        dialog.restart_requested.connect(UpdateService.restart_app)
+        dialog.exec()
+
+    update_svc.update_available.connect(_show_update_dialog)
+    update_svc.up_to_date.connect(
+        lambda: window.show_toast("OmniDownloader is up to date ✓")
+    )
+
+    # Wire "Check for Updates" button in Settings page
+    settings_panel = window._settings._panel
+    settings_panel._check_update_btn.clicked.connect(update_svc.check_for_updates)
+
+    # Non-blocking auto-check on startup (2s delay so UI renders first)
+    from PyQt6.QtCore import QTimer
+    QTimer.singleShot(2000, update_svc.check_for_updates)
+
     # Wire anonymity page signals
     from omnidownloader.core.proxy_manager import ProxyConfig, ProxyType
     anon = window._anonymity
