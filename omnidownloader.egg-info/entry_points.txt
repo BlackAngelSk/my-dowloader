@@ -1,0 +1,2 @@
+[console_scripts]
+omnidownloader = omnidownloader.main:main

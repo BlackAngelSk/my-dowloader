@@ -1,0 +1,20 @@
+[project]
+name = "omnidownloader"
+version = "0.1.0"
+description = "Ultra-fast modular download manager with anonymity support"
+requires-python = ">=3.11"
+dependencies = [
+    "PyQt6>=6.6.0",
+    "aiohttp>=3.9.0",
+    "aiohttp-socks>=0.8.0",
+    "pysocks>=1.7.1",
+    "stem>=1.8.1",
+    "aiodns>=3.1.1",
+]
+
+[project.scripts]
+omnidownloader = "omnidownloader.main:main"
+
+[project.optional-dependencies]
+torrent = ["python-libtorrent"]
+dev = ["pytest", "ruff"]

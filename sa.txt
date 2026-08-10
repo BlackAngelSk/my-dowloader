@@ -1,0 +1,123 @@
+You are an expert Software Architect and Senior Full-Stack Developer specialized in high-performance networking, desktop UI design, and multi-protocol file transfer systems.
+
+Your task is to build a modern, ultra-fast, cross-platform modular downloader application called **"OmniDownloader"**.
+
+---
+
+### 1. Core Architecture & Stack Requirements
+
+- **Backend / Engine:** Rust or Python (PyQt6 / PySide6 / `asyncio`) or Node.js (Tauri + Rust/C++ binding for core performance).
+- **Frontend / UI:** Modern UI framework with native dark and light mode support (Tailwind CSS + React/Vue via Tauri, OR PyQt6 / CustomTkinter with custom QSS themes).
+- **Core Engine Principle:** Maximum disk I/O and network saturation.
+  - Multi-threaded segmented downloading (Dynamic Range requests).
+  - RAM buffering ($16\text{ MB} - 64\text{ MB}$ memory buffer before flushing to disk) to prevent disk thrashing and maximize write speed up to NVMe/SSD physical limits.
+  - Async I/O for zero-blocking UI execution.
+
+---
+
+### 2. Key Modules & Functional Requirements
+
+The app MUST be modular, allowing users or developers to easily add new download providers via a plugin architecture.
+
+#### A. Torrent Module
+- Support for `.torrent` files and `magnet:` links.
+- Library: `libtorrent` wrapper or native Rust torrent library.
+- Features: Peer discovery, DHT, tracker management, sequential download toggle (for media streaming), speed cap settings, and selective file downloading within torrent bundles.
+
+#### B. Video & Social Media Extractor Module
+- Powered by `yt-dlp` integration or custom extractors.
+- **Supported Platforms:** YouTube (Videos, Playlists, Shorts), Twitter/X (Videos & Images), Facebook, TikTok, Instagram (Reels & Posts), Reddit, Twitch.
+- **Features:**
+  - Video format/resolution selection (1080p, 4K, 8K, 60fps).
+  - One-click Audio Extraction (MP3, AAC, FLAC, M4A).
+  - Automatic muxing of Video + Audio tracks using `ffmpeg`.
+  - Subtitle auto-downloader.
+
+#### C. Direct File & Batch Image Scraper Module
+- Multi-connection HTTP/HTTPS/FTP downloader.
+- Dynamic chunk splitting: If file size is $S$ and thread count is $N$, split range into chunks $C_i = [i \cdot \frac{S}{N}, (i+1) \cdot \frac{S}{N} - 1]$.
+- **Image Downloader:** Scrapes image galleries from web pages, social media threads, and direct URL lists. Features auto-deduplication, thumbnail preview generation, and batch naming.
+
+---
+
+### 3. UI/UX Design & Theme Specifications
+
+- **Ease of Use (One-Click Workflow):**
+  - **Auto Clipboard Monitor:** Detect copied links matching supported domains and prompt an quick overlay/toast: *"Download video/torrent detected. Click to add."*
+  - **Drag-and-Drop Zone:** Drop `.torrent` files, text files with link lists, or URLs directly into the app window.
+  - **Simple Dashboard:** 
+    - Input bar at the top (Auto-pasting detected URLs).
+    - Progress cards showing file name, speed graph, ETA, percentage progress bar, and action buttons (Pause, Resume, Stop, Open Folder).
+- **Dark & Light Mode:**
+  - Auto-detection based on System Preferences.
+  - Toggle switch in settings and header.
+  - **Dark Palette:** Deep Charcoal Slate (`#0F172A`), Card Dark (`#1E293B`), Accent Electric Blue (`#3B82F6`) or Neon Teal (`#14B8A6`).
+  - **Light Palette:** Crisp Clean White (`#F8FAFC`), Card Light (`#FFFFFF`), Accent Navy/Blue (`#2563EB`).
+
+---
+
+### 4. Application Architecture Diagram
++-----------------------------------------------------------------------+
+| USER INTERFACE |
+| (Tauri / PyQt6 - Dark & Light Mode, Clipboard Monitor) |
++-----------------------------------------------------------------------+
+|
+v
++-----------------------------------------------------------------------+
+| DOWNLOAD MANAGER & SCHEDULER |
+| (Queue Management, Speed Limiter, Disk Flush RAM Buffer) |
++-----------------------------------------------------------------------+
+| | | |
+v v v v
++---------------+ +---------------+ +---------------+ +--------------+
+| Torrent Engine| | Media Module | | Direct Engine | | Image Engine |
+| (libtorrent) | | (yt-dlp) | | (Multi-part) | | (Scraper) |
++---------------+ +---------------+ +---------------+ +--------------+
+
+---
+
+### 5. Implementation Deliverables Required
+
+1. **Folder Structure Setup:** Provide an organized modular directory layout.
+2. **Core Downloader Engine Code:** Implement a multi-threaded, high-speed HTTP chunked downloader with RAM buffering logic.
+3. **YT & Torrent Handler Code:** Provide modular wrappers for handling `yt-dlp` execution and torrent magnet links.
+4. **UI Implementation Code:** Build a clean UI interface with Dark/Light theme switching capability, paste detection, and job queues.
+
+
+
+Technical Details & Specifications
+1. Memory Buffering & Zero-Copy I/O
+To prevent disk bottlenecking on high-speed connections (e.g., 1 Gbps or 2.5 Gbps fiber connections):
+
+Chunk Size Strategy: Dynamically set thread allocation based on file size:
+Threads=min(32,max(4, 
+50
+File Size in MB
+​
+ ))
+RAM Ring Buffer: Accumulate incoming stream packets into a contiguous memory buffer (16 MB−64 MB) before issuing a single sequential disk write block.
+Direct Disk Allocation: Pre-allocate the full file size on disk (fallocate on Linux, SetFileValidData on Windows) before downloading begins to prevent file fragmentation.
+2. Auto Dependency Management
+Embed portable binaries for dependencies like ffmpeg and yt-dlp.
+Automatic background updates for yt-dlp definitions to prevent breaking changes when platforms like Twitter or YouTube update their stream APIs.
+Every downloader module must implement standard interface methods:
+
+
+from abc import ABC, abstractmethod
+
+class BaseDownloaderModule(ABC):
+    @abstractmethod
+    def can_handle(self, url: str) -> bool:
+        """Returns True if this module handles the provided URL or protocol."""
+        pass
+
+    @abstractmethod
+    async def extract_metadata(self, url: str) -> dict:
+        """Returns metadata (title, filesize, thumbnail, available resolutions)."""
+        pass
+
+    @abstractmethod
+    async def start_download(self, url: str, download_path: str, progress_callback: callable):
+        """Starts the downloading process with progress callbacks."""
+        pass
+

@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: omnidownloader
+Version: 0.1.0
+Summary: Ultra-fast modular download manager with anonymity support
+Requires-Python: >=3.11
+Requires-Dist: PyQt6>=6.6.0
+Requires-Dist: aiohttp>=3.9.0
+Requires-Dist: aiohttp-socks>=0.8.0
+Requires-Dist: pysocks>=1.7.1
+Requires-Dist: stem>=1.8.1
+Requires-Dist: aiodns>=3.1.1
+Provides-Extra: torrent
+Requires-Dist: python-libtorrent; extra == "torrent"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: ruff; extra == "dev"
