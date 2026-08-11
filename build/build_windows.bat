@@ -43,7 +43,7 @@ echo.
 
 REM ── Step 2: PyInstaller bundle ──────────────────────────────
 echo [2/4] Building PyInstaller bundle...
-pyinstaller build\windows.spec --noconfirm --clean --log-level WARN
+pyinstaller windows.spec --noconfirm --clean --log-level WARN
 if errorlevel 1 (
     echo ERROR: PyInstaller build failed.
     pause

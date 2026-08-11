@@ -7,11 +7,11 @@ from pathlib import Path
 block_cipher = None
 
 a = Analysis(
-    ['../omnidownloader/__main__.py'],
-    pathex=[str(Path('..').resolve())],
+    ['omnidownloader/__main__.py'],
+    pathex=[],
     binaries=[],
     datas=[
-        ('../omnidownloader/ui', 'omnidownloader/ui'),
+        ('omnidownloader/ui', 'omnidownloader/ui'),
     ],
     hiddenimports=[
         'PyQt6.QtWidgets',
@@ -60,8 +60,8 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=False,  # GUI app, no console window
-    icon=None,  # Add .ico path here when available
+    console=False,
+    icon=None,
 )
 
 coll = COLLECT(

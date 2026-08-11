@@ -42,7 +42,7 @@ jobs:
           fi
 
       - name: Build PyInstaller bundle
-        run: pyinstaller build\windows.spec --noconfirm --clean
+        run: pyinstaller windows.spec --noconfirm --clean
 
       - name: Install Inno Setup
         run: choco install innosetup -y
