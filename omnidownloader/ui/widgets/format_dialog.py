@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
 logger = logging.getLogger(__name__)
 
 
-def _fmt_size(b: int) -> str:
+def _fmt_size(b: int | float) -> str:
     if b <= 0:
         return "?"
     for u in ("B", "KB", "MB", "GB"):
