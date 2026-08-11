@@ -19,14 +19,27 @@ _python_dlls = []
 for _dll in glob.glob(os.path.join(_python_dir, 'python3*.dll')):
     _python_dlls.append((_dll, '.'))
 
+# ── Find Python stdlib (encodings, etc.) for Python 3.14
+_lib_dir = os.path.join(_python_dir, '..', 'Lib')
+_lib_dir = os.path.normpath(_lib_dir)
+if os.path.isdir(_lib_dir):
+    _stdlib_pathex = [_lib_dir]
+else:
+    _stdlib_pathex = []
+
 a = Analysis(
     ['omnidownloader/__main__.py'],
-    pathex=[str(PROJECT_ROOT)],
+    pathex=[str(PROJECT_ROOT)] + _stdlib_pathex,
     binaries=_python_dlls,
     datas=[
         ('omnidownloader/ui', 'omnidownloader/ui'),
     ],
     hiddenimports=[
+        'encodings',
+        'encodings.utf_8',
+        'encodings.latin_1',
+        'encodings.ascii',
+        'encodings.cp1252',
         'PyQt6.QtWidgets',
         'PyQt6.QtCore',
         'PyQt6.QtGui',
