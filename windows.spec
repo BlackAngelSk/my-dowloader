@@ -2,14 +2,27 @@
 # Produces a single-folder bundle that Inno Setup wraps into an installer.
 
 import sys
+import os
+import glob
 from pathlib import Path
 
 block_cipher = None
 
+# ── Force paths so PyInstaller never collides with our build/ folder
+PROJECT_ROOT = Path(__file__).resolve().parent
+DISTPATH = str(PROJECT_ROOT / 'dist')
+WORKPATH = str(PROJECT_ROOT / 'build' / '_pyinstaller_tmp')
+
+# ── Collect Python runtime DLLs (critical for Python 3.14)
+_python_dir = str(Path(sys.executable).parent)
+_python_dlls = []
+for _dll in glob.glob(os.path.join(_python_dir, 'python3*.dll')):
+    _python_dlls.append((_dll, '.'))
+
 a = Analysis(
     ['omnidownloader/__main__.py'],
-    pathex=[],
-    binaries=[],
+    pathex=[str(PROJECT_ROOT)],
+    binaries=_python_dlls,
     datas=[
         ('omnidownloader/ui', 'omnidownloader/ui'),
     ],
