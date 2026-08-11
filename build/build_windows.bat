@@ -41,9 +41,19 @@ if errorlevel 1 (
 )
 echo.
 
+REM ── Step 1.5: Clean old PyInstaller artifacts ───────────────
+echo Cleaning old build artifacts...
+if exist "build\windows_internal" rmdir /s /q "build\windows_internal" 2>nul
+if exist "build\OmniDownloader" rmdir /s /q "build\OmniDownloader" 2>nul
+if exist "build\Analysis-00.toc" del /f /q "build\Analysis-00.toc" 2>nul
+if exist "build\warn-*.txt" del /f /q "build\warn-*.txt" 2>nul
+if exist "build\xref-*.html" del /f /q "build\xref-*.html" 2>nul
+if exist "dist\OmniDownloader" rmdir /s /q "dist\OmniDownloader" 2>nul
+echo.
+
 REM ── Step 2: PyInstaller bundle ──────────────────────────────
 echo [2/4] Building PyInstaller bundle...
-pyinstaller windows.spec --noconfirm --clean --log-level WARN
+pyinstaller windows.spec --noconfirm --clean --log-level WARN --workpath build\_pyinstaller_tmp --distpath dist
 if errorlevel 1 (
     echo ERROR: PyInstaller build failed.
     pause
@@ -93,4 +103,5 @@ echo ============================================================
 echo.
 pause
 endlocal
+
 
