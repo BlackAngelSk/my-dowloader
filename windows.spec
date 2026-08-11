@@ -9,9 +9,9 @@ from pathlib import Path
 block_cipher = None
 
 # ── Force paths so PyInstaller never collides with our build/ folder
-PROJECT_ROOT = Path(__file__).resolve().parent
-DISTPATH = str(PROJECT_ROOT / 'dist')
-WORKPATH = str(PROJECT_ROOT / 'build' / '_pyinstaller_tmp')
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+DISTPATH = os.path.join(PROJECT_ROOT, 'dist')
+WORKPATH = os.path.join(PROJECT_ROOT, 'build', '_pyinstaller_tmp')
 
 # ── Collect Python runtime DLLs (critical for Python 3.14)
 _python_dir = str(Path(sys.executable).parent)
