@@ -7,11 +7,11 @@ from pathlib import Path
 block_cipher = None
 
 a = Analysis(
-    ['omnidownloader/__main__.py'],
-    pathex=[],
+    ['../omnidownloader/__main__.py'],
+    pathex=[str(Path('..').resolve())],
     binaries=[],
     datas=[
-        ('omnidownloader/ui', 'omnidownloader/ui'),
+        ('../omnidownloader/ui', 'omnidownloader/ui'),
     ],
     hiddenimports=[
         'PyQt6.QtWidgets',
