@@ -26,14 +26,14 @@ call "%VENV_DIR%\Scripts\activate.bat"
 
 REM ── Step 1: Install build dependencies ──────────────────────
 echo [1/4] Installing build dependencies...
-pip install --upgrade pip
-pip install pyinstaller packaging
+python -m pip install --upgrade pip
+python -m pip install pyinstaller packaging
 if errorlevel 1 (
     echo ERROR: Failed to install build dependencies.
     pause
     exit /b 1
 )
-pip install -e .
+python -m pip install -e .
 if errorlevel 1 (
     echo ERROR: Failed to install project dependencies.
     pause
@@ -43,7 +43,7 @@ echo.
 
 REM ── Step 2: PyInstaller bundle ──────────────────────────────
 echo [2/4] Building PyInstaller bundle...
-pyinstaller build\windows.spec --noconfirm --clean --log-level WARNING
+pyinstaller build\windows.spec --noconfirm --clean --log-level WARN
 if errorlevel 1 (
     echo ERROR: PyInstaller build failed.
     pause
