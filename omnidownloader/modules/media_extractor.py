@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -24,8 +25,16 @@ MEDIA_DOMAINS = {
     "instagram.com",
     "facebook.com", "fb.watch", "fb.com",
     "reddit.com", "v.redd.it",
-    "twitch.tv", "vimeo.com", "dailymotion.com",
+    "twitch.tv", "clips.twitch.tv", "vimeo.com", "dailymotion.com",
     "bilibili.com", "soundcloud.com", "bandcamp.com",
+    "rutube.ru", "www.rutube.ru",
+    # Popular platforms
+    "kick.com",
+    "ok.ru",
+    "dzen.ru",
+    "nicovideo.jp", "nico.ms",
+    "odysee.com", "odys.ly",
+    "archive.org",
 }
 
 # ── Universal best-quality format strings ──────────────────────
@@ -50,6 +59,53 @@ YOUTUBE_DOMAINS = {"youtube.com", "youtu.be", "m.youtube.com"}
 _YOUTUBE_EXTRACTOR_ARGS = (
     "--extractor-args", "youtube:player_client=android_vr,web"
 )
+
+
+# ── Regex for parsing yt-dlp download progress ─────────────────
+# Matches lines like:
+#   [download]  45.2% of  100.00MiB at   12.34MiB/s ETA 00:03
+#   [download]  99.7% of ~ 281.30MiB at    8.65MiB/s ETA 00:01 (frag 104/105)
+_DL_PROGRESS_RE = re.compile(
+    r"\[download\]\s+"
+    r"([\d.]+)%"                     # 1: percentage
+    r"\s+of\s+"
+    r"~?\s*"
+    r"([\d.]+)\s*"                   # 2: size value
+    r"(KiB|MiB|GiB|TiB|B)"          # 3: size unit
+    r"\s+at\s+"
+    r"([\d.]+)\s*"                   # 4: speed value
+    r"(KiB/s|MiB/s|GiB/s|TiB/s|B/s)" # 5: speed unit
+    r"(?:\s+ETA\s+"
+    r"(\d+:\d+(?::\d+)?))?"          # 6: ETA (optional)
+)
+
+_SIZE_UNITS = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
+_SPEED_UNITS = {"B/s": 1, "KiB/s": 1024, "MiB/s": 1024**2, "GiB/s": 1024**3, "TiB/s": 1024**4}
+
+
+def _parse_size_bytes(value: float, unit: str) -> int:
+    """Convert a size value + unit to bytes."""
+    return int(value * _SIZE_UNITS.get(unit, 1))
+
+
+def _parse_speed_bps(value: float, unit: str) -> float:
+    """Convert a speed value + unit to bytes per second."""
+    return value * _SPEED_UNITS.get(unit, 1)
+
+
+def _parse_eta_seconds(eta_str: str) -> float | None:
+    """Parse an ETA string like '01:23' or '1:02:03' to seconds."""
+    if not eta_str:
+        return None
+    parts = eta_str.split(":")
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + int(parts[1])
+        elif len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    except ValueError:
+        return None
+    return None
 
 
 class MediaExtractor(BaseDownloaderModule):
@@ -87,6 +143,28 @@ class MediaExtractor(BaseDownloaderModule):
             host = (urlparse(url).hostname or "").removeprefix("www.")
             return host in MEDIA_DOMAINS
         except Exception:
+            return False
+
+    @staticmethod
+    async def probe_url(url: str, ytdlp_path: str = "yt-dlp") -> bool:
+        """Quick probe: return True if yt-dlp can handle *url*.
+
+        Runs ``yt-dlp --simulate --no-download`` and checks the exit code.
+        This is used as a catch-all fallback for URLs not in MEDIA_DOMAINS.
+        """
+        if not shutil.which(ytdlp_path):
+            return False
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                ytdlp_path, "--simulate", "--no-download",
+                "--no-warnings", "--no-check-certificates",
+                url,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=15)
+            return proc.returncode == 0
+        except (asyncio.TimeoutError, OSError):
             return False
 
     async def extract_metadata(self, url):
@@ -189,16 +267,33 @@ class MediaExtractor(BaseDownloaderModule):
                     await proc.wait()
                     raise asyncio.CancelledError()
                 text = line.decode(errors="replace").strip()
-                if "[download]" in text and "%" in text:
-                    try:
-                        for part in text.split():
-                            if part.endswith("%"):
-                                job.progress_percent = float(part.rstrip("%"))
-                                break
-                    except (ValueError, IndexError):
-                        pass
-                    if progress_callback:
-                        progress_callback(job)
+                if "[download]" in text:
+                    # Try to parse the full progress line with size, speed, ETA
+                    m = _DL_PROGRESS_RE.search(text)
+                    if m:
+                        pct = float(m.group(1))
+                        total_bytes = _parse_size_bytes(float(m.group(2)), m.group(3))
+                        speed = _parse_speed_bps(float(m.group(4)), m.group(5))
+                        eta = _parse_eta_seconds(m.group(6) or "")
+
+                        job.file_size = total_bytes
+                        job.update_speed(speed)
+                        # Set downloaded_bytes directly from percentage + total
+                        job.downloaded_bytes = int(pct / 100.0 * total_bytes)
+
+                        if progress_callback:
+                            progress_callback(job)
+                    elif "%" in text:
+                        # Fallback: at least parse the percentage
+                        try:
+                            for part in text.split():
+                                if part.endswith("%"):
+                                    job.progress_percent = float(part.rstrip("%"))
+                                    break
+                        except (ValueError, IndexError):
+                            pass
+                        if progress_callback:
+                            progress_callback(job)
                 elif "[Merger]" in text or "[ExtractAudio]" in text:
                     job.state = DownloadState.MERGING
                     if progress_callback:

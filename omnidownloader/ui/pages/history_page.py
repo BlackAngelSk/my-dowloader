@@ -7,7 +7,6 @@ from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
     QSizePolicy, QVBoxLayout, QWidget,
 )
-from PyQt6.QtCore import Qt
 from omnidownloader.core.models import DownloadJob, DownloadState
 
 

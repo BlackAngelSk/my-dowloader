@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
@@ -166,9 +166,10 @@ class SchedulerPanel(QWidget):
     def _refresh_rules_list(self) -> None:
         while self._rules_layout.count():
             item = self._rules_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
+            if item is not None:
+                w = item.widget()
+                if w:
+                    w.deleteLater()
         if not self._rules:
             lbl = QLabel("No rules configured.")
             lbl.setObjectName("muted")
@@ -183,7 +184,7 @@ class SchedulerPanel(QWidget):
                 f"{'unlimited' if rule.global_speed_limit <= 0 else _speed_to_display(rule.global_speed_limit) + ' MB/s'}"
             )
             lbl = QLabel(info)
-            lbl.setTextFormat(2)
+            lbl.setTextFormat(Qt.TextFormat.RichText)
             row.addWidget(lbl, 1)
             rm = QPushButton("\u2715")
             rm.setObjectName("iconButton")

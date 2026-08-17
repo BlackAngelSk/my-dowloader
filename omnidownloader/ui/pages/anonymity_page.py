@@ -1,13 +1,11 @@
 """Anonymity & Privacy page — proxy config, Tor, kill switch, IP check."""
 
 from __future__ import annotations
-
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
-
 
 class AnonymityPage(QWidget):
     proxy_config_changed = pyqtSignal(dict)
@@ -35,6 +33,20 @@ class AnonymityPage(QWidget):
         sl.addWidget(self._country_label)
         self._latency_label = QLabel("")
         self._latency_label.setObjectName("muted")
+        sl.addWidget(self._latency_label)
+        br = QHBoxLayout()
+        self._check_btn = QPushButton("🔄 Check IP Now")
+        self._check_btn.setObjectName("primaryButton")
+        self._check_btn.clicked.connect(self.ip_check_requested.emit)
+        br.addWidget(self._check_btn)
+        self._rotate_btn = QPushButton("🔄 New Tor Circuit")
+        self._rotate_btn.setObjectName("iconButton")
+        self._rotate_btn.clicked.connect(self.tor_rotate_requested.emit)
+        br.addWidget(self._rotate_btn)
+        br.addStretch()
+        sl.addLayout(br)
+        sg.setLayout(sl)
+        root.addWidget(sg)
 
         # Proxy Configuration
         pg = QGroupBox("Proxy Configuration")
@@ -90,6 +102,22 @@ class AnonymityPage(QWidget):
         self._kill_interval = QSpinBox()
         self._kill_interval.setRange(5, 300)
         self._kill_interval.setValue(15)
+        self._kill_interval.setSuffix(" seconds")
+        kf.addRow("Enable:", self._kill_btn)
+        kf.addRow("Status:", self._kill_status)
+        kf.addRow("Check Interval:", self._kill_interval)
+        kg.setLayout(kf)
+        root.addWidget(kg)
+
+        # DNS
+        dg = QGroupBox("DNS Leak Protection")
+        df = QFormLayout()
+        self._dns_label = QLabel("Remote DNS via SOCKS5 (when proxy active)")
+        self._dns_label.setObjectName("subtitle")
+        df.addRow("Method:", self._dns_label)
+        dg.setLayout(df)
+        root.addWidget(dg)
+        root.addStretch()
 
     def _on_proxy_toggled(self):
         enabled = self._proxy_enabled.isChecked()
@@ -138,35 +166,3 @@ class AnonymityPage(QWidget):
         if not code or len(code) != 2:
             return ""
         return chr(0x1F1E6 + ord(code[0]) - ord("A")) + chr(0x1F1E6 + ord(code[1]) - ord("A"))
-
-        self._kill_interval.setSuffix(" seconds")
-        kf.addRow("Enable:", self._kill_btn)
-        kf.addRow("Status:", self._kill_status)
-        kf.addRow("Check Interval:", self._kill_interval)
-        kg.setLayout(kf)
-        root.addWidget(kg)
-
-        # DNS
-        dg = QGroupBox("DNS Leak Protection")
-        df = QFormLayout()
-        self._dns_label = QLabel("Remote DNS via SOCKS5 (when proxy active)")
-        self._dns_label.setObjectName("subtitle")
-        df.addRow("Method:", self._dns_label)
-        dg.setLayout(df)
-        root.addWidget(dg)
-        root.addStretch()
-
-        sl.addWidget(self._latency_label)
-        br = QHBoxLayout()
-        self._check_btn = QPushButton("🔄 Check IP Now")
-        self._check_btn.setObjectName("primaryButton")
-        self._check_btn.clicked.connect(self.ip_check_requested.emit)
-        br.addWidget(self._check_btn)
-        self._rotate_btn = QPushButton("🔄 New Tor Circuit")
-        self._rotate_btn.setObjectName("iconButton")
-        self._rotate_btn.clicked.connect(self.tor_rotate_requested.emit)
-        br.addWidget(self._rotate_btn)
-        br.addStretch()
-        sl.addLayout(br)
-        sg.setLayout(sl)
-        root.addWidget(sg)

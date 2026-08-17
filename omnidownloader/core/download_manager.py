@@ -88,11 +88,11 @@ class DownloadManager(QObject):
         else:
             mod = self.find_module_for_url(url)
             if mod is None:
-                job.state = DownloadState.FAILED
-                job.error_message = "No module registered for this URL."
-                self._jobs[job.id] = job
-                return job
-            job.module = DownloadModule(mod.MODULE_NAME.lower())
+                # No module matched — schedule a yt-dlp probe in the background
+                # The job stays PENDING; _dispatch_job will probe and assign.
+                job.module = DownloadModule.UNKNOWN
+            else:
+                job.module = DownloadModule(mod.MODULE_NAME.lower())
         if download_path:
             job.file_path = download_path
         self._jobs[job.id] = job
@@ -214,6 +214,31 @@ class DownloadManager(QObject):
 
     async def _dispatch_job(self, job):
         mod = self.find_module_for_url(job.url)
+
+        # Catch-all fallback: if no module claimed the URL, probe with yt-dlp
+        if mod is None and job.module == DownloadModule.UNKNOWN:
+            from omnidownloader.modules.media_extractor import MediaExtractor
+            # Find existing MediaExtractor to get its configured paths
+            existing: MediaExtractor | None = self.find_module_by_type(MediaExtractor)  # type: ignore[assignment]
+            ytdlp = existing._ytdlp if existing else "yt-dlp"
+            ffmpeg = existing._ffmpeg if existing else "ffmpeg"
+            logger.info("No module matched URL, probing with yt-dlp: %s", job.url)
+            job.state = DownloadState.EXTRACTING
+            self.job_state_changed.emit(job.id, job.state.value)
+            is_media = await MediaExtractor.probe_url(job.url, ytdlp)
+            if is_media:
+                if existing:
+                    mod = existing
+                else:
+                    mod = MediaExtractor(ytdlp_path=ytdlp, ffmpeg_path=ffmpeg)
+                job.module = DownloadModule.MEDIA
+                logger.info("yt-dlp probe succeeded — routing to MediaExtractor")
+            else:
+                job.state = DownloadState.FAILED
+                job.error_message = "No module can handle this URL and yt-dlp does not support it."
+                self.job_state_changed.emit(job.id, job.state.value)
+                return
+
         if mod is None:
             job.state = DownloadState.FAILED
             job.error_message = "No module can handle this URL."
@@ -325,5 +350,12 @@ class DownloadManager(QObject):
     def find_module_for_url(self, url: str) -> Optional[BaseDownloaderModule]:
         for m in self._modules:
             if m.can_handle(url):
+                return m
+        return None
+
+    def find_module_by_type(self, cls) -> Optional[BaseDownloaderModule]:
+        """Return the first registered module that is an instance of *cls*."""
+        for m in self._modules:
+            if isinstance(m, cls):
                 return m
         return None

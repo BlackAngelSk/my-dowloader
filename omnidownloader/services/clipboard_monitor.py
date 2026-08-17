@@ -22,9 +22,17 @@ SUPPORTED_DOMAINS = {
     "instagram.com",
     "facebook.com", "fb.watch",
     "reddit.com", "v.redd.it",
-    "twitch.tv",
+    "twitch.tv", "clips.twitch.tv",
     "imgur.com", "flickr.com",
     "soundcloud.com",
+    "rutube.ru", "www.rutube.ru",
+    # Popular platforms
+    "kick.com",
+    "ok.ru",
+    "dzen.ru",
+    "nicovideo.jp", "nico.ms",
+    "odysee.com", "odys.ly",
+    "archive.org",
 }
 
 

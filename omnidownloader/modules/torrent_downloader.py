@@ -20,6 +20,7 @@ try:
     import libtorrent as lt
     HAS_LIBTORRENT = True
 except ImportError:
+    lt = None  # type: ignore[assignment]
     HAS_LIBTORRENT = False
 
 HAS_ARIA2C = shutil.which("aria2c") is not None
@@ -47,6 +48,9 @@ class TorrentDownloader(BaseDownloaderModule):
             return False
         if url.startswith("magnet:"):
             return True
+        if urlparse(url).path.lower().endswith(".torrent"):
+            return True
+        return False
 
     async def extract_metadata(self, url):
         if HAS_LIBTORRENT:
@@ -54,6 +58,7 @@ class TorrentDownloader(BaseDownloaderModule):
         return {"name": "Torrent", "total_size": -1, "files": [], "thumbnail": ""}
 
     async def _meta_lt(self, url):
+        assert lt is not None  # guarded by HAS_LIBTORRENT
         session = self._get_lt()
         if url.startswith("magnet:"):
             handle = lt.add_magnet_uri(session, url, {"save_path": self._save_path})
@@ -121,6 +126,7 @@ class TorrentDownloader(BaseDownloaderModule):
         await proc.wait()
 
     async def _dl_lt(self, job, progress_callback):
+        assert lt is not None  # guarded by HAS_LIBTORRENT
         session = self._get_lt()
         job.state = DownloadState.DOWNLOADING
         self._cancel_flags[job.id] = False
@@ -174,6 +180,7 @@ class TorrentDownloader(BaseDownloaderModule):
 
     def _get_lt(self):
         if self._session is None:
+            assert lt is not None  # guarded by HAS_LIBTORRENT
             settings = {"listen_interfaces": f"0.0.0.0:{self._listen_port}",
                         "enable_dht": True, "enable_lsd": True,
                         "enable_natpmp": True, "enable_upnp": True}
@@ -191,18 +198,4 @@ class TorrentDownloader(BaseDownloaderModule):
         handle = self._handles.pop(job.id, None)
         if handle and self._session:
             self._session.remove_torrent(handle)
-
         self._cancel_flags.pop(job.id, None)
-        if proc.returncode != 0 and proc.returncode != 137:
-            stderr = (await proc.stderr.read()).decode(errors="replace")[:500] if proc.stderr else ""
-            if "cancelled" not in stderr.lower():
-                raise RuntimeError(f"aria2c failed: {stderr}")
-        candidates = sorted(Path(self._save_path).glob("*"), key=os.path.getmtime, reverse=True)
-        if candidates:
-            job.file_path = str(candidates[0])
-            job.file_name = candidates[0].name
-
-            job.state = DownloadState.FAILED
-            job.error_message = "Install aria2 (pacman -S aria2) for torrent support"
-
-        return urlparse(url).path.endswith(".torrent")

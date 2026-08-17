@@ -43,8 +43,14 @@ class HTTPDownloader(BaseDownloaderModule):
                 "twitter.com", "x.com", "nitter.net",
                 "tiktok.com", "vm.tiktok.com",
                 "instagram.com", "facebook.com", "fb.watch",
-                "reddit.com", "v.redd.it", "twitch.tv",
-                "vimeo.com", "soundcloud.com",
+                "reddit.com", "v.redd.it", "twitch.tv", "clips.twitch.tv",
+                "vimeo.com", "soundcloud.com", "dailymotion.com",
+                "bilibili.com", "bandcamp.com",
+                "rutube.ru",
+                "kick.com", "ok.ru", "dzen.ru",
+                "nicovideo.jp", "nico.ms",
+                "odysee.com", "odys.ly",
+                "archive.org",
             }
             if host in media_hosts:
                 return False

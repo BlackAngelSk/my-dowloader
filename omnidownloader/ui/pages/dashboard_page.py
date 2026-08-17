@@ -95,11 +95,12 @@ class DashboardPage(QWidget):
                 self._empty_label.show()
 
     def update_global_speed(self, speed_bps: float) -> None:
+        display_bps = speed_bps
         for u in ("B/s", "KB/s", "MB/s", "GB/s"):
-            if speed_bps < 1024:
-                self._global_speed_label.setText(f"Global Speed: {speed_bps:.1f} {u}")
+            if display_bps < 1024:
+                self._global_speed_label.setText(f"Global Speed: {display_bps:.1f} {u}")
                 break
-            speed_bps /= 1024
+            display_bps /= 1024
         self._speed_graph.add_sample(speed_bps)
 
     # ── Internal slots — emit signals for MainWindow ──────────
