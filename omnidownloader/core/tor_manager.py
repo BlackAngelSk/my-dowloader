@@ -65,9 +65,9 @@ class TorManager:
         try:
             from stem import Signal
             from stem.control import Controller
-            with Controller.from_port(port=self._control_port) as ctrl:
+            with Controller.from_port(port=self._control_port) as ctrl:  # type: ignore[arg-type]
                 ctrl.authenticate(password=self._control_password)
-                ctrl.signal(Signal.NEWNYM)
+                ctrl.signal(Signal.NEWNYM)  # type: ignore[attr-defined]
                 await asyncio.sleep(2)
                 return True
         except Exception as exc:

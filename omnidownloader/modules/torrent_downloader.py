@@ -178,7 +178,7 @@ class TorrentDownloader(BaseDownloaderModule):
         self._handles.pop(job.id, None)
         self._cancel_flags.pop(job.id, None)
 
-    def _get_lt(self):
+    def _get_lt(self) -> Any:
         if self._session is None:
             assert lt is not None  # guarded by HAS_LIBTORRENT
             settings = {"listen_interfaces": f"0.0.0.0:{self._listen_port}",
