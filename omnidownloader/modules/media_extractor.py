@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from omnidownloader.core.base_module import BaseDownloaderModule
 from omnidownloader.core.models import DownloadJob, DownloadState
 from omnidownloader.core.disk_utils import ensure_directory
+from omnidownloader.services.dependency_manager import DependencyManager
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,31 @@ class MediaExtractor(BaseDownloaderModule):
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._proxy_manager = proxy_manager
 
+    async def _ensure_ytdlp_available(self) -> str:
+        """Ensure yt-dlp exists at ``self._ytdlp``, downloading it if necessary.
+
+        Returns the (possibly updated) path to the yt-dlp binary.
+        Raises ``RuntimeError`` if the binary cannot be obtained.
+        """
+        # Check if the path points to an existing file
+        if Path(self._ytdlp).exists():
+            return self._ytdlp
+        # Check if the name is available on PATH (e.g. "yt-dlp" via pip)
+        if shutil.which(self._ytdlp):
+            return self._ytdlp
+        # Try to auto-download
+        logger.info("yt-dlp not found — attempting automatic download…")
+        try:
+            dm = DependencyManager()
+            path = await dm.ensure_ytdlp()
+            self._ytdlp = path
+            return path
+        except Exception as exc:
+            raise RuntimeError(
+                f"yt-dlp not found and auto-download failed: {exc}\n"
+                "Install it manually: https://github.com/yt-dlp/yt-dlp#installation"
+            ) from exc
+
     # ── YouTube helper methods ──────────────────────────────────
 
     @staticmethod
@@ -139,9 +165,27 @@ class MediaExtractor(BaseDownloaderModule):
     # ── URL routing ─────────────────────────────────────────────
 
     def can_handle(self, url):
+        """Accept any HTTP/HTTPS URL — yt-dlp supports thousands of sites.
+
+        Excludes direct image file URLs so ImageScraper can handle those,
+        and the ``scrape:`` prefix which is an ImageScraper convention.
+        """
         try:
-            host = (urlparse(url).hostname or "").removeprefix("www.")
-            return host in MEDIA_DOMAINS
+            if url.startswith("scrape:"):
+                return False  # let ImageScraper handle it
+            scheme = urlparse(url).scheme.lower()
+            if scheme in ("http", "https"):
+                # Exclude direct image file links (ImageScraper territory)
+                path = urlparse(url).path.lower()
+                _IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+                              ".svg", ".tiff", ".avif")
+                if any(path.endswith(e) for e in _IMAGE_EXT):
+                    return False
+                return True
+            # Also accept other schemes yt-dlp understands (rtmp, rtsp, etc.)
+            if scheme in ("rtmp", "rtmpe", "rtmps", "rtsp", "mms", "m3u8"):
+                return True
+            return False
         except Exception:
             return False
 
@@ -151,8 +195,17 @@ class MediaExtractor(BaseDownloaderModule):
 
         Runs ``yt-dlp --simulate --no-download`` and checks the exit code.
         This is used as a catch-all fallback for URLs not in MEDIA_DOMAINS.
+        If yt-dlp is not found, attempts auto-download first.
         """
-        if not shutil.which(ytdlp_path):
+        # If yt-dlp not found, try to auto-download
+        if not Path(ytdlp_path).exists() and not shutil.which(ytdlp_path):
+            try:
+                dm = DependencyManager()
+                ytdlp_path = await dm.ensure_ytdlp()
+            except Exception:
+                logger.warning("Could not auto-download yt-dlp for probe")
+                return False
+        if not shutil.which(ytdlp_path) and not Path(ytdlp_path).exists():
             return False
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -168,10 +221,7 @@ class MediaExtractor(BaseDownloaderModule):
             return False
 
     async def extract_metadata(self, url):
-        if not shutil.which(self._ytdlp):
-            raise RuntimeError(
-                f"yt-dlp not found at '{self._ytdlp}'. Install it: pacman -S yt-dlp"
-            )
+        await self._ensure_ytdlp_available()
         cmd = [self._ytdlp, "--dump-json", "--no-download",
                "--no-warnings", "--no-check-certificates"]
         self._append_youtube_args(cmd, url)
@@ -216,10 +266,12 @@ class MediaExtractor(BaseDownloaderModule):
         job.state = DownloadState.DOWNLOADING
         self._cancel_events[job.id] = asyncio.Event()
 
-        # Ensure yt-dlp is available
-        if not shutil.which(self._ytdlp):
+        # Ensure yt-dlp is available (auto-download if missing)
+        try:
+            await self._ensure_ytdlp_available()
+        except RuntimeError as exc:
             job.state = DownloadState.FAILED
-            job.error_message = f"yt-dlp not found. Install it: pacman -S yt-dlp"
+            job.error_message = str(exc)
             return
 
         # Resolve ffmpeg path and check availability for merge-heavy downloads
@@ -305,8 +357,8 @@ class MediaExtractor(BaseDownloaderModule):
             stderr_bytes = await proc.stderr.read() if proc.stderr else b""
             stderr_out = stderr_bytes.decode(errors="replace")
             raise RuntimeError(f"yt-dlp failed: {stderr_out[:500]}")
-        parent = Path(job.file_path).parent if job.file_path else Path.cwd()
-        candidates = sorted(parent.glob("*"), key=os.path.getmtime, reverse=True)
+        # Find the downloaded file in the output directory
+        candidates = sorted(output_dir.glob("*"), key=os.path.getmtime, reverse=True)
         if candidates:
             job.file_path = str(candidates[0])
 

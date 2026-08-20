@@ -68,14 +68,39 @@ def main() -> None:
     from omnidownloader.modules.image_scraper import ImageScraper
     from omnidownloader.modules.torrent_downloader import TorrentDownloader
 
-    # ── Dependency check (needed before wiring paths) ──────────
+    # ── Dependency check & auto-install (needed before wiring paths) ──
     from omnidownloader.services.dependency_manager import DependencyManager
 
     deps = DependencyManager()
     status = deps.check_all()
     for name, ok in status.items():
         if not ok:
-            logger.warning("%s not found — certain features may be unavailable.", name)
+            logger.info("%s not found locally — will auto-install in background.", name)
+
+    # Schedule background auto-download once the async engine is running.
+    # After download finishes, update the paths wired into MediaExtractor.
+    async def _auto_install_deps():
+        try:
+            paths = await deps.ensure_all()
+            if "yt-dlp" in paths:
+                for mod in modules:
+                    if isinstance(mod, MediaExtractor):
+                        mod._ytdlp = paths["yt-dlp"]
+            if "ffmpeg" in paths:
+                for mod in modules:
+                    if isinstance(mod, MediaExtractor):
+                        mod._ffmpeg = paths["ffmpeg"]
+            missing = [n for n, ok in deps.check_all().items() if not ok]
+            if not missing:
+                logger.info("All dependencies are ready.")
+            else:
+                logger.warning("Some dependencies could not be installed: %s", missing)
+        except Exception:
+            logger.exception("Background dependency auto-install failed")
+
+    # 2-second delay so the UI renders first, then schedule on the
+    # background asyncio loop (the engine thread starts shortly after).
+    QTimer.singleShot(2000, lambda: schedule_async(_auto_install_deps()))
 
     for mod in modules:
         if isinstance(mod, (HTTPDownloader, MediaExtractor, ImageScraper)):
