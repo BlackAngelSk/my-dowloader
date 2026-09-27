@@ -10,6 +10,7 @@ and selective-file download all need.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,6 +143,60 @@ def read_metadata(path: str | Path) -> TorrentMeta:
     if not result.name and result.files:
         result.name = result.files[0].path.split("/")[0]
     return result
+
+
+def raw_info_span(data: bytes) -> bytes:
+    """The exact byte span of a torrent's ``info`` value.
+
+    BitTorrent's info-hash is the SHA-1 of these bytes *as they appear in the
+    file*: decoding and re-encoding the dict would produce a different hash
+    (dict key order, integer forms), so the raw span is extracted instead.
+    """
+    key = b"4:info"
+    start = data.index(key) + len(key)
+    depth = 0
+    index = start
+    while index < len(data):
+        char = data[index:index + 1]
+        if char in (b"d", b"l"):
+            depth += 1
+            index += 1
+        elif char == b"e":
+            depth -= 1
+            index += 1
+            if depth == 0:
+                return data[start:index]
+        elif char == b"i":
+            index = data.index(b"e", index) + 1
+        else:
+            colon = data.index(b":", index)
+            length = int(data[index:colon])
+            index = colon + 1 + length
+    raise BencodeError("unterminated info dictionary")
+
+
+def infohash(path: str | Path) -> str:
+    """The lowercase hex info-hash of a .torrent file ("" when unavailable)."""
+    try:
+        blob = Path(path).read_bytes()
+        return hashlib.sha1(raw_info_span(blob)).hexdigest()
+    except (OSError, ValueError, BencodeError) as exc:
+        logger.debug("Could not compute the info-hash of %s: %s", path, exc)
+        return ""
+
+
+def infohash_from_magnet(magnet: str) -> str:
+    """The info-hash carried by a magnet link ("" when absent)."""
+    from urllib.parse import parse_qs, urlparse
+
+    try:
+        query = parse_qs(urlparse(magnet).query)
+    except ValueError:
+        return ""
+    for xt in query.get("xt", []):
+        if xt.lower().startswith("urn:btih:"):
+            return xt[len("urn:btih:"):].strip().lower()
+    return ""
 
 
 def find_saved_metadata(directory: str | Path) -> Path | None:

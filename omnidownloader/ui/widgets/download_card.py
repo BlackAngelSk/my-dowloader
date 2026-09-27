@@ -179,7 +179,14 @@ class DownloadCard(QFrame):
         self._bar.setValue(int(j.progress_percent * 10))
         self._speed_lbl.setText(_fmt_speed(j.speed_bps))
         self._size_lbl.setText(f"{_fmt_size(j.downloaded_bytes)} / {_fmt_size(j.file_size)}")
-        self._eta_lbl.setText(f"ETA: {_fmt_eta(j.eta_seconds)}")
+        # A torrent that is waiting for peers/seeders has no ETA and no speed:
+        # showing "ETA: —" at a frozen 0% is what made a dead torrent look like
+        # a broken app.  The module sets status_note while it waits.
+        note = j.metadata.get("status_note") if isinstance(j.metadata, dict) else None
+        if note and j.state in (DownloadState.DOWNLOADING, DownloadState.EXTRACTING):
+            self._eta_lbl.setText(str(note)[:60])
+        else:
+            self._eta_lbl.setText(f"ETA: {_fmt_eta(j.eta_seconds)}")
         active = j.state in (DownloadState.DOWNLOADING, DownloadState.EXTRACTING)
         paused = j.state == DownloadState.PAUSED
         self._pause_btn.setText("\u25b6" if paused else "\u23f8")

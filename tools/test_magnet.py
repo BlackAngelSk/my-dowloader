@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from omnidownloader.core import torrent_meta  # noqa: E402
+from omnidownloader.core import platform_utils, torrent_meta  # noqa: E402
 from omnidownloader.core.download_manager import DownloadManager  # noqa: E402
 from omnidownloader.core.models import (  # noqa: E402
     DownloadJob, DownloadModule, DownloadState,
@@ -210,6 +210,158 @@ def test_exit_code_messages() -> None:
           _aria2_failure(1, ["Tracker: not authorized"]))
 
 
+def test_infohash(tmp: Path) -> None:
+    """The info-hash identifies a torrent (used to spot duplicate downloads)."""
+    import hashlib
+
+    path = make_torrent(tmp, multi=False)
+    blob = path.read_bytes()
+    info = {b"name": b"single.iso", b"length": 4096,
+            b"piece length": 262144, b"pieces": b"y" * 20}
+    expected = hashlib.sha1(bencode(info)).hexdigest()
+    check("a .torrent file's info-hash is computed correctly",
+          torrent_meta.infohash(path) == expected,
+          f"{torrent_meta.infohash(path)} vs {expected}")
+    check("a magnet's info-hash is read from the link",
+          torrent_meta.infohash_from_magnet(
+              "magnet:?xt=urn:btih:6008CDF59CA7AE985834A5C8EE8FE853CF6DE81E&dn=x")
+          == "6008cdf59ca7ae985834a5c8ee8fe853cf6de81e")
+    check("a magnet without an xt has no info-hash",
+          torrent_meta.infohash_from_magnet("magnet:?dn=only-a-name") == "")
+    check("a non-torrent file has no info-hash",
+          torrent_meta.infohash(tmp / "notatorrent.torrent") == "")
+
+
+def test_no_peer_detection(tmp: Path) -> None:
+    """A torrent nobody can serve must fail with an explanation, not hang.
+
+    Two shapes of "dead" and both are invisible to the user otherwise:
+      CN:0        — no peers at all
+      CN:27 SD:0  — leechers connected, but no seeder has the data, so the
+                    metadata phase sits at 0B/0B forever.
+    """
+    mod = TorrentDownloader()
+    mod.no_peer_timeout = 0.05
+    job = DownloadJob(url="magnet:?xt=urn:btih:" + "e" * 40,
+                      module=DownloadModule.TORRENT)
+
+    mod._parse_torrent_progress(job, "[#1 0B/0B CN:0 SD:0 DL:0B]", None)
+    check("the peer count is recorded from aria2c",
+          job.metadata.get("peers") == 0 and job.metadata.get("seeders") == 0,
+          f"peers={job.metadata.get('peers')} seeders={job.metadata.get('seeders')}")
+    mod._check_sources(job)
+    check("peerless time starts counting", job.id in mod._no_source_since)
+    check("the UI gets a status note while waiting",
+          job.metadata.get("status_note") == "waiting for peers…",
+          repr(job.metadata.get("status_note")))
+    time.sleep(0.06)
+    check("a peerless torrent is reported as dead", mod._source_starved(job))
+    check("the no-peer message explains what to do",
+          "no peers" in mod._dead_torrent_message(job),
+          mod._dead_torrent_message(job)[:70])
+
+    # Leechers connected but no seeder: the metadata never arrives.
+    dead_swarm = DownloadJob(url="magnet:?xt=urn:btih:" + "a" * 40,
+                             module=DownloadModule.TORRENT)
+    mod._parse_torrent_progress(
+        dead_swarm, "FILE: [MEMORY][METADATA]some.name.mkv", None)
+    mod._parse_torrent_progress(dead_swarm, "[#1 0B/0B CN:27 SD:0 DL:0B]", None)
+    mod._check_sources(dead_swarm)
+    check("a leecher-only swarm starts the countdown",
+          dead_swarm.id in mod._no_source_since)
+    check("the status note explains the seeder problem",
+          "no seeder" in (dead_swarm.metadata.get("status_note") or ""),
+          repr(dead_swarm.metadata.get("status_note")))
+    time.sleep(0.06)
+    check("a leecher-only swarm is reported as dead",
+          mod._source_starved(dead_swarm))
+    check("the seeder message says it cannot finish",
+          "no seeder" not in "" and "cannot" in mod._dead_torrent_message(dead_swarm),
+          mod._dead_torrent_message(dead_swarm)[:90])
+
+    # A healthy swarm clears everything.
+    mod._parse_torrent_progress(job, "[#1 2MiB/756MiB(0%) CN:7 SD:3 DL:1MiB]", None)
+    mod._check_sources(job)
+    check("a healthy swarm clears the countdown",
+          not mod._source_starved(job) and job.metadata["peers"] == 7
+          and "status_note" not in job.metadata,
+          f"peers={job.metadata.get('peers')} note={job.metadata.get('status_note')!r}")
+
+    # A transfer that is actually moving is never aborted, even if the summary
+    # momentarily reports zero peers (peers churn during a download).
+    moving = DownloadJob(url="magnet:?xt=urn:btih:" + "f" * 40,
+                         module=DownloadModule.TORRENT)
+    moving.file_size = 1000
+    moving.downloaded_bytes = 500
+    mod._parse_torrent_progress(moving, "[#2 500B/1000B(50%) CN:0 SD:0 DL:0B]", None)
+    mod._check_sources(moving)
+    time.sleep(0.06)
+    check("a moving download is never called dead", not mod._source_starved(moving))
+
+
+def test_proxy_routing(tmp: Path) -> None:
+    """With Tor/a proxy set, torrent traffic must not leak direct."""
+    class FakeProxy:
+        enabled = True
+
+        def get_proxy_url(self):
+            return "socks5://127.0.0.1:9050"
+
+    mod = TorrentDownloader(proxy_manager=FakeProxy())
+    job = DownloadJob(url="magnet:?xt=urn:btih:" + "a" * 40,
+                      module=DownloadModule.TORRENT)
+    cmd = mod._aria2_command(job)
+    check("torrents are routed through the proxy",
+          "--all-proxy" in cmd and "socks5://127.0.0.1:9050" in cmd,
+          " ".join(cmd[cmd.index("--all-proxy"):cmd.index("--all-proxy") + 2])
+          if "--all-proxy" in cmd else "MISSING")
+    check("DHT is disabled when proxied (UDP would leak the real IP)",
+          "--enable-dht=false" in cmd,
+          " ".join(f for f in cmd if "dht" in f.lower()))
+    check("LPD is disabled when proxied",
+          "--bt-enable-lpd=false" in cmd)
+
+    plain = TorrentDownloader()
+    plain_cmd = plain._aria2_command(job)
+    check("without a proxy DHT stays enabled",
+          "--enable-dht=true" in plain_cmd and "--all-proxy" not in plain_cmd)
+
+
+def test_duplicate_guard() -> None:
+    """Two aria2c writers for one torrent truncate each other's progress."""
+    import subprocess
+
+    mod = TorrentDownloader()
+    key = "a" * 40
+    first = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                             **platform_utils.subprocess_kwargs())
+    mod._procs_by_hash[key] = first
+    mod._reap_duplicate(key)
+    try:
+        first.wait(timeout=10)
+        check("a duplicate download for the same torrent is stopped", True,
+              f"exit={first.returncode}")
+    except subprocess.TimeoutExpired:
+        first.kill()
+        check("a duplicate download for the same torrent is stopped", False,
+              "still running")
+    check("the stopped process is forgotten", key not in mod._procs_by_hash)
+
+    # Shutdown must reap everything still running.
+    second = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                              **platform_utils.subprocess_kwargs())
+    mod._procs_by_hash["b" * 40] = second
+    mod.stop_processes()
+    try:
+        second.wait(timeout=10)
+        check("shutdown stops the aria2c processes", True, f"exit={second.returncode}")
+    except subprocess.TimeoutExpired:
+        second.kill()
+        check("shutdown stops the aria2c processes", False, "still running")
+    check("all bookkeeping is cleared on shutdown",
+          not mod._procs_by_hash and not mod._phases and not mod._no_source_since)
+
+
 def test_describe_result(tmp: Path) -> None:
     """After a download the job must point at the real file, not nothing."""
     mod = TorrentDownloader(save_path=str(tmp))
@@ -339,6 +491,10 @@ async def main() -> int:
         test_progress_parsing()
         test_aria2_command()
         test_exit_code_messages()
+        test_infohash(tmp)
+        test_no_peer_detection(tmp)
+        test_proxy_routing(tmp)
+        test_duplicate_guard()
         test_describe_result(tmp)
         await test_routing()
         if live:

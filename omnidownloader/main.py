@@ -178,7 +178,11 @@ def main() -> None:
     QTimer.singleShot(2000, lambda: schedule_async(_auto_install_deps()))
 
     for mod in modules:
-        if isinstance(mod, (HTTPDownloader, MediaExtractor, ImageScraper)):
+        # TorrentDownloader used to be missing from this list: with Tor or a
+        # proxy enabled, torrent traffic went out directly (a real IP leak)
+        # while every other module was routed.
+        if isinstance(mod, (HTTPDownloader, MediaExtractor, ImageScraper,
+                            TorrentDownloader)):
             mod._proxy_manager = proxy_mgr
         if isinstance(mod, (HTTPDownloader, TorrentDownloader)):
             mod._bw = dm.bandwidth_manager

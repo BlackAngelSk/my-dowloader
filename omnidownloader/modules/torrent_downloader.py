@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
@@ -12,7 +13,7 @@ from urllib.parse import urlparse
 from omnidownloader.core import platform_utils
 from omnidownloader.core.base_module import BaseDownloaderModule
 from omnidownloader.core.torrent_meta import (
-    BencodeError, find_saved_metadata, read_metadata,
+    BencodeError, find_saved_metadata, infohash, infohash_from_magnet, read_metadata,
 )
 from omnidownloader.core.disk_utils import ensure_directory
 from omnidownloader.core.models import DownloadJob, DownloadState
@@ -108,6 +109,14 @@ class TorrentDownloader(BaseDownloaderModule):
         self._aria2c = platform_utils.find_aria2c()
         #: Per-job aria2c phase: "metadata" or "transfer" (see the parser).
         self._phases: dict[str, str] = {}
+        #: Live aria2c processes by info-hash, so the same torrent cannot be
+        #: downloaded twice at once (two writers in `--dir` truncate each
+        #: other, which looked like "the magnet stopped working").
+        self._procs_by_hash: dict[str, asyncio.subprocess.Process] = {}
+        #: When each job last had no usable source (dead-torrent detector).
+        self._no_source_since: dict[str, float] = {}
+        #: How long a swarm may fail to serve data before we call it dead.
+        self.no_peer_timeout = 120.0
 
     def can_handle(self, url: str) -> bool:
         if not HAS_LIBTORRENT and not HAS_ARIA2C:
@@ -232,6 +241,115 @@ class TorrentDownloader(BaseDownloaderModule):
             )
             return
 
+    # ── dead-torrent detection & duplicate guards ───────────────
+
+    @staticmethod
+    def _job_hash_key(job) -> str:
+        """Identify the torrent a job refers to (magnet hash or file hash)."""
+        if job.url.startswith("magnet:"):
+            return infohash_from_magnet(job.url)
+        if job.url.lower().endswith(".torrent"):
+            return infohash(job.url.replace("file://", ""))
+        return ""
+
+    def _reap_duplicate(self, hash_key: str) -> None:
+        """Kill a previous aria2c for the same torrent.
+
+        Two aria2c processes writing the same file in the same directory
+        truncate each other's progress, so a re-added magnet could sit at 0%
+        forever while a second process fought the first one.
+        """
+        old = self._procs_by_hash.get(hash_key)
+        if old is not None and old.returncode is None:
+            logger.warning(
+                "Another aria2c is already downloading this torrent (pid %s) — "
+                "stopping it before starting a new attempt", old.pid,
+            )
+            platform_utils.kill_process_tree(old)
+        self._procs_by_hash.pop(hash_key, None)
+
+    def _check_sources(self, job) -> None:
+        """Track whether the swarm can actually serve the data.
+
+        Two ways a torrent is dead, both invisible to the user otherwise:
+
+        * ``CN:0`` — nobody is connected at all;
+        * ``CN:27 SD:0`` — leechers are connected but no seeder has the data,
+          which is why the metadata phase can sit at ``0B/0B`` forever.
+        """
+        peers = job.metadata.get("peers")
+        seeders = job.metadata.get("seeders")
+        if peers is None and seeders is None:
+            return
+
+        moving = job.downloaded_bytes > 0
+        starved = not moving and ((peers or 0) == 0 or (seeders or 0) == 0)
+        if not starved:
+            self._no_source_since.pop(job.id, None)
+            job.metadata.pop("status_note", None)
+            return
+
+        self._no_source_since.setdefault(job.id, time.monotonic())
+        if (peers or 0) == 0:
+            job.metadata["status_note"] = "waiting for peers…"
+        elif self._phases.get(job.id) == "metadata":
+            job.metadata["status_note"] = (
+                f"{peers} peers connected, but no seeder has the metadata yet…"
+            )
+        else:
+            job.metadata["status_note"] = (
+                f"{peers} peers connected, waiting for a seeder…"
+            )
+
+    def _source_starved(self, job) -> bool:
+        """True when the swarm has been unable to serve data for the window."""
+        started = self._no_source_since.get(job.id)
+        if started is None:
+            return False
+        # Never abort a transfer that is actually moving.
+        if job.downloaded_bytes > 0:
+            return False
+        elapsed = time.monotonic() - started
+        if elapsed >= self.no_peer_timeout:
+            logger.warning(
+                "No usable source for %.0fs on %s (peers=%s seeders=%s) — giving up",
+                elapsed, job.url[:60], job.metadata.get("peers"),
+                job.metadata.get("seeders"),
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _dead_torrent_message(job) -> str:
+        peers = job.metadata.get("peers")
+        seeders = job.metadata.get("seeders")
+        if not peers:
+            return (
+                "no peers found — this torrent looks dead: nothing is "
+                "advertising its pieces. Check the magnet/tracker, or try a "
+                "well-seeded torrent."
+            )
+        return (
+            f"{peers} peers are connected but none of them is a seeder "
+            f"(seeders: {seeders if seeders is not None else 'unknown'}), so no "
+            "complete copy of this torrent exists in the swarm. It cannot "
+            "finish — try another source."
+        )
+
+    def stop_processes(self) -> None:
+        """Kill every aria2c this module started (sync; used on shutdown).
+
+        Without this, closing the app left torrents running detached (four
+        aria2c processes were found still downloading after one session).
+        """
+        for hash_key, proc in list(self._procs_by_hash.items()):
+            if proc.returncode is None:
+                logger.info("Stopping aria2c for %s", hash_key[:12])
+                platform_utils.kill_process_tree(proc)
+        self._procs_by_hash.clear()
+        self._phases.clear()
+        self._no_source_since.clear()
+
     def _aria2_command(self, job) -> list[str]:
         """The aria2c argv for *job* (kept separate so it can be asserted)."""
         cmd = [self._aria2c or "aria2c", "--dir", self._save_path, "--seed-time=0",
@@ -267,18 +385,34 @@ class TorrentDownloader(BaseDownloaderModule):
             proxy = self._proxy_manager.get_proxy_url()
             if proxy:
                 cmd += ["--all-proxy", proxy]
+                # SOCKS carries TCP only: DHT, UDP trackers and LPD would leave
+                # the machine directly and defeat the proxy (with Tor enabled
+                # that is a real IP leak).
+                cmd += ["--enable-dht=false", "--bt-enable-lpd=false",
+                        "--disable-ipv6=true", "--bt-tracker-connect-timeout=20"]
+                logger.info(
+                    "Torrent traffic routed through %s — peer connections are "
+                    "slow, and DHT/LPD are disabled to avoid leaks", proxy,
+                )
         cmd.append(job.url)
         return cmd
 
     async def _dl_aria2(self, job, progress_callback):
         job.state = DownloadState.DOWNLOADING
+        hash_key = self._job_hash_key(job)
+        if hash_key:
+            self._reap_duplicate(hash_key)
+
         before = self._snapshot_dir(Path(self._save_path))
         cmd = self._aria2_command(job)
         logger.info("Starting aria2c torrent download")
+        self._no_source_since[job.id] = time.monotonic()
 
         proc = await asyncio.create_subprocess_exec(
             *cmd, **platform_utils.subprocess_kwargs(),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        if hash_key:
+            self._procs_by_hash[hash_key] = proc
 
         # Drain stderr: aria2c writes there freely, and once the 64 KiB pipe
         # buffer fills it blocks forever — stdout never closes and the
@@ -320,6 +454,14 @@ class TorrentDownloader(BaseDownloaderModule):
                         # aria2c saved the .torrent it just fetched — use it for
                         # the real size and file list while the download runs.
                         self._apply_saved_metadata(job)
+                    self._check_sources(job)
+                    if self._source_starved(job):
+                        # Zero peers for the whole window: the torrent is dead,
+                        # and hanging for another five minutes would just look
+                        # like the app being broken.
+                        platform_utils.kill_process_tree(proc)
+                        await proc.wait()
+                        raise RuntimeError(self._dead_torrent_message(job))
             await proc.wait()
         finally:
             drain_task.cancel()
@@ -383,28 +525,43 @@ class TorrentDownloader(BaseDownloaderModule):
             try:
                 percent = float(text.split("(")[1].split("%")[0])
             except (IndexError, ValueError):
-                return
-            if phase == "metadata":
-                # Not payload progress — ignore it entirely.
-                return
-            # Size first: Job.progress_percent is *derived* from
-            # downloaded_bytes / file_size, so feeding it a percentage before
-            # the size is known silently does nothing (progress stuck at 0%).
-            for token in text.split():
-                if "/" in token:
-                    # "756MiB/756MiB(50%)" — the percentage rides on the
-                    # denominator, and _size_to_bytes would choke on it.
-                    total = _size_to_bytes(token.split("/")[1].split("(")[0])
-                    if total:
-                        job.file_size = total
-                elif token.startswith("DL:"):
-                    speed = _size_to_bytes(token.split(":", 1)[1])
-                    if speed:
-                        job.update_speed(float(speed))
-            if job.file_size > 0:
-                job.downloaded_bytes = int(job.file_size * percent / 100)
-            if progress_callback:
-                progress_callback(job)
+                percent = None
+            if percent is not None and phase != "metadata":
+                # Size first: Job.progress_percent is *derived* from
+                # downloaded_bytes / file_size, so feeding it a percentage
+                # before the size is known silently does nothing.
+                for token in text.split():
+                    if "/" in token:
+                        # "756MiB/756MiB(50%)" — the percentage rides on the
+                        # denominator, and _size_to_bytes would choke on it.
+                        total = _size_to_bytes(token.split("/")[1].split("(")[0])
+                        if total:
+                            job.file_size = total
+                if job.file_size > 0:
+                    job.downloaded_bytes = int(job.file_size * percent / 100)
+
+        # Peer/speed tokens appear on *every* summary line, including the ones
+        # without a percentage — and that is exactly the peerless case
+        # ("[#x 0B/0B CN:0 SD:0 DL:0B]") that has to be detected.  Parsing them
+        # only inside the percentage branch meant a dead torrent was invisible.
+        for token in text.split():
+            if token.startswith("CN:"):
+                try:
+                    job.metadata["peers"] = int(token.split(":", 1)[1])
+                except ValueError:
+                    pass
+            elif token.startswith("SD:"):
+                try:
+                    job.metadata["seeders"] = int(token.split(":", 1)[1])
+                except ValueError:
+                    pass
+            elif token.startswith("DL:"):
+                speed = _size_to_bytes(token.split(":", 1)[1])
+                if speed:
+                    job.update_speed(float(speed))
+
+        if text.startswith("[#") and progress_callback:
+            progress_callback(job)
         elif job.state != DownloadState.DOWNLOADING:
             job.state = DownloadState.DOWNLOADING
             if progress_callback:
@@ -591,7 +748,8 @@ class TorrentDownloader(BaseDownloaderModule):
                 logger.debug("remove_torrent failed for %s: %s", job.id, exc)
 
     async def close(self) -> None:
-        """Release the libtorrent session."""
+        """Release the libtorrent session and stop the aria2c processes."""
+        self.stop_processes()
         self._handles.clear()
         self._cancel_flags.clear()
         self._session = None
