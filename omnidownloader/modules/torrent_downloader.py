@@ -30,6 +30,45 @@ HAS_ARIA2C = bool(platform_utils.find_aria2c())
 if not HAS_LIBTORRENT and not HAS_ARIA2C:
     logger.warning("Neither libtorrent nor aria2c found — torrent downloads unavailable")
 
+#: aria2c exit codes worth translating: a bare number in a job card tells the
+#: user nothing.  Values from aria2c's man page (EXIT STATUS).
+_ARIA2_EXIT_REASONS: dict[int, str] = {
+    1: "aria2 reported an unknown error",
+    2: "download timed out",
+    3: "the file was not found on any tracker or peer",
+    5: "the download was too slow and aria2 gave up (no peers with data)",
+    6: "network problem — check the connection, proxy or firewall",
+    9: "not enough free disk space",
+    11: "the same file is already being downloaded",
+    12: "the same torrent is already being downloaded",
+    13: "the target file already exists without an aria2 control file",
+    14: "could not rename the existing file",
+    15: "could not open the existing file",
+    16: "could not create the file (check the download folder)",
+    17: "filesystem error — check permissions on the download folder",
+    18: "could not create the download folder",
+    19: "name resolution failed (DNS)",
+    22: "the server sent an unexpected HTTP response",
+    24: "the server rejected authentication",
+    25: "the torrent file is not valid bencode",
+    26: "the torrent's data is corrupted",
+    27: "the magnet link is malformed",
+    28: "aria2 rejected an option it was given",
+    32: "checksum validation failed — the downloaded data is corrupt",
+}
+
+
+def _aria2_failure(code: int, tracker_errors: list[str] | None = None) -> str:
+    """A human-readable reason for an aria2c exit code."""
+    reason = _ARIA2_EXIT_REASONS.get(code)
+    parts = [f"aria2c exited with code {code}"]
+    if reason:
+        parts.append(reason)
+    if tracker_errors:
+        # The tracker's own words are the most specific thing available.
+        parts.append(tracker_errors[-1])
+    return " — ".join(parts)
+
 
 def _size_to_bytes(text: str) -> int:
     """Parse aria2c's size tokens ("756MiB", "1.2GiB", "512KiB", "0B")."""
@@ -193,9 +232,8 @@ class TorrentDownloader(BaseDownloaderModule):
             )
             return
 
-    async def _dl_aria2(self, job, progress_callback):
-        job.state = DownloadState.DOWNLOADING
-        before = self._snapshot_dir(Path(self._save_path))
+    def _aria2_command(self, job) -> list[str]:
+        """The aria2c argv for *job* (kept separate so it can be asserted)."""
         cmd = [self._aria2c or "aria2c", "--dir", self._save_path, "--seed-time=0",
                "--bt-stop-timeout=300", "--summary-interval=1",
                # notice (not warn): aria2c prints its progress summary AND the
@@ -203,6 +241,15 @@ class TorrentDownloader(BaseDownloaderModule):
                # card at a frozen 0% for the whole download.
                "--enable-color=false", "--console-log-level=notice",
                "--continue=true",
+               # Without allow-overwrite aria2 refuses to touch an existing
+               # file for a torrent and exits 13 ("File ... exists, but a
+               # control file (*.aria2) does not exist"), which is what a user
+               # re-adding a finished torrent hit.  With it, plus
+               # check-integrity, an already-complete file is hash-verified
+               # (2s for 756 MiB) instead of silently re-downloaded (19s), and
+               # a truncated file resumes only the missing pieces.
+               "--allow-overwrite=true",
+               "--check-integrity=true",
                # Keep the metadata aria2c fetches for a magnet: it is the only
                # way to know the name/size without libtorrent, and it lets the
                # job card show something other than "Torrent / unknown".
@@ -221,6 +268,12 @@ class TorrentDownloader(BaseDownloaderModule):
             if proxy:
                 cmd += ["--all-proxy", proxy]
         cmd.append(job.url)
+        return cmd
+
+    async def _dl_aria2(self, job, progress_callback):
+        job.state = DownloadState.DOWNLOADING
+        before = self._snapshot_dir(Path(self._save_path))
+        cmd = self._aria2_command(job)
         logger.info("Starting aria2c torrent download")
 
         proc = await asyncio.create_subprocess_exec(
@@ -280,11 +333,7 @@ class TorrentDownloader(BaseDownloaderModule):
         self._describe_result(job, before)
 
         if proc.returncode not in (0, None):
-            detail = tracker_errors[-1] if tracker_errors else ""
-            raise RuntimeError(
-                f"aria2c exited with code {proc.returncode}"
-                + (f" — {detail}" if detail else "")
-            )
+            raise RuntimeError(_aria2_failure(proc.returncode, tracker_errors))
         if tracker_errors and not job.progress_percent:
             # aria2c exited 0 but never got data: surface the tracker's own
             # words instead of a silently empty download.
@@ -404,25 +453,55 @@ class TorrentDownloader(BaseDownloaderModule):
         return True
 
     def _describe_result(self, job, before: set[str]) -> None:
-        """Point the job at what aria2c produced (file or directory)."""
+        """Point the job at what aria2c produced (file or directory).
+
+        Also covers the re-add case: when the data was already complete,
+        aria2c verifies it and creates nothing new, so the result has to be
+        located by name — otherwise the card showed no file, no size and 0%.
+        """
         save_path = Path(self._save_path)
-        self._apply_saved_metadata(job)
+        self._apply_saved_metadata(job)          # magnets: aria2c's .torrent
+
+        meta = self._meta_from_file(job.url)     # .torrent file/URL path
+        if meta is not None:
+            job.file_name = job.file_name or meta.name
+            job.file_size = job.file_size or meta.total_size
+            job.metadata["torrent_files"] = [
+                {"path": f.path, "length": f.length} for f in meta.files
+            ]
 
         new_entries = [
             p for p in save_path.iterdir()
             if p.name not in before and not p.name.endswith(".aria2")
             and not p.name.endswith(".torrent")
         ]
-        if not new_entries:
+        target: Path | None = None
+        if new_entries:
+            # A single-file torrent lands as one file; a multi-file one as a
+            # directory named after the torrent.
+            target = max(new_entries, key=lambda p: (p.is_dir(), p.stat().st_size))
+        else:
+            candidate = save_path / (job.file_name or "")
+            if job.file_name and candidate.exists():
+                target = candidate
+                logger.info(
+                    "Torrent content already present and verified: %s", target.name
+                )
+
+        if target is None:
             return
-        # A single-file torrent lands as one file; a multi-file one as a
-        # directory named after the torrent.
-        target = max(new_entries, key=lambda p: (p.is_dir(), p.stat().st_size))
         job.file_path = str(target)
         if not job.file_name:
             job.file_name = target.name
-        if target.is_file() and not job.file_size:
-            job.file_size = target.stat().st_size
+
+        if target.is_file():
+            size = target.stat().st_size
+            job.file_size = job.file_size or size
+            if job.file_size and size >= job.file_size:
+                # Fully on disk: report it as complete rather than 0%.
+                job.downloaded_bytes = job.file_size
+        elif target.is_dir() and job.file_size:
+            job.downloaded_bytes = job.file_size
 
     async def _dl_lt(self, job, progress_callback):
         assert lt is not None  # guarded by HAS_LIBTORRENT

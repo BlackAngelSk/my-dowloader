@@ -33,7 +33,7 @@ from omnidownloader.core.torrent_meta import (  # noqa: E402
     BencodeError, TorrentFile, read_metadata,
 )
 from omnidownloader.modules.torrent_downloader import (  # noqa: E402
-    HAS_ARIA2C, HAS_LIBTORRENT, TorrentDownloader, _size_to_bytes,
+    HAS_ARIA2C, HAS_LIBTORRENT, TorrentDownloader, _aria2_failure, _size_to_bytes,
 )
 
 RESULTS: list[tuple[str, bool, str]] = []
@@ -170,6 +170,46 @@ def test_progress_parsing() -> None:
           mod._phases[job.id] == "transfer", mod._phases[job.id])
 
 
+def test_aria2_command() -> None:
+    """The argv must prevent the exit-13 'file already exists' failure."""
+    mod = TorrentDownloader()
+    job = DownloadJob(url="magnet:?xt=urn:btih:" + "d" * 40,
+                      module=DownloadModule.TORRENT)
+    cmd = mod._aria2_command(job)
+    check("aria2c allows overwriting an existing file (exit 13 fix)",
+          "--allow-overwrite=true" in cmd,
+          " ".join(f for f in cmd if "overwrite" in f) or "MISSING")
+    check("aria2c integrity-checks existing data instead of re-downloading",
+          "--check-integrity=true" in cmd,
+          " ".join(f for f in cmd if "integrity" in f) or "MISSING")
+    check("aria2c keeps progress output enabled",
+          "--console-log-level=notice" in cmd)
+    check("aria2c resumes partial downloads",
+          "--continue=true" in cmd)
+    check("aria2c has DHT entry points for tracker-less magnets",
+          "--dht-entry-point=router.bittorrent.com:6881" in cmd
+          and "--enable-dht=true" in cmd)
+    check("the URL is the last argument", cmd[-1] == job.url, cmd[-1][:40])
+    check("the download directory is passed", "--dir" in cmd)
+
+    limited = TorrentDownloader(max_download_rate=512)
+    check("a rate limit is applied when configured",
+          "--max-overall-download-limit" in limited._aria2_command(job))
+
+
+def test_exit_code_messages() -> None:
+    check("exit 13 is explained",
+          "already exists" in _aria2_failure(13), _aria2_failure(13)[:70])
+    check("exit 9 mentions disk space",
+          "disk space" in _aria2_failure(9), _aria2_failure(9)[:60])
+    check("an unknown code still produces a readable message",
+          _aria2_failure(99).startswith("aria2c exited with code 99"),
+          _aria2_failure(99))
+    check("the tracker's own message is included when available",
+          "not authorized" in _aria2_failure(1, ["Tracker: not authorized"]),
+          _aria2_failure(1, ["Tracker: not authorized"]))
+
+
 def test_describe_result(tmp: Path) -> None:
     """After a download the job must point at the real file, not nothing."""
     mod = TorrentDownloader(save_path=str(tmp))
@@ -247,12 +287,49 @@ async def test_live(magnet: str, budget: int = 90) -> None:
     shutil.rmtree(tmp, ignore_errors=True)
 
 
+async def test_live_twice(source: str) -> None:
+    """The same torrent twice: the second run must not fail with exit 13.
+
+    aria2c refuses to touch an existing file for a torrent unless told
+    otherwise ("File ... exists, but a control file (*.aria2) does not exist,
+    Download was canceled"), which is exactly what a user re-adding a finished
+    torrent hits.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="magnettwice-"))
+    mod = TorrentDownloader(save_path=str(tmp))
+    try:
+        for label in ("first run", "second run (file already exists)"):
+            job = DownloadJob(url=source, module=DownloadModule.TORRENT)
+            started = time.time()
+            try:
+                await mod.start_download(job)
+                ok = True
+                detail = ""
+            except Exception as exc:  # noqa: BLE001
+                ok, detail = False, f"{type(exc).__name__}: {str(exc)[:160]}"
+            elapsed = time.time() - started
+            check(f"live: {label} succeeds", ok, detail or f"{elapsed:.1f}s")
+            if ok:
+                check(f"live: {label} reports the result",
+                      bool(job.file_name) and job.file_size > 0
+                      and bool(job.file_path),
+                      f"{job.file_name!r} {job.file_size} "
+                      f"{Path(job.file_path).name!r}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 async def main() -> int:
     live = ""
+    live_twice = ""
     if "--live" in sys.argv:
         idx = sys.argv.index("--live")
         if idx + 1 < len(sys.argv):
             live = sys.argv[idx + 1]
+    if "--live-twice" in sys.argv:
+        idx = sys.argv.index("--live-twice")
+        if idx + 1 < len(sys.argv):
+            live_twice = sys.argv[idx + 1]
 
     tmp = Path(tempfile.mkdtemp(prefix="magnettest-"))
     try:
@@ -260,12 +337,16 @@ async def main() -> int:
         test_metadata_discovery(tmp)
         test_size_tokens()
         test_progress_parsing()
+        test_aria2_command()
+        test_exit_code_messages()
         test_describe_result(tmp)
         await test_routing()
         if live:
             await test_live(live)
-        else:
+        elif not live_twice:
             print("[SKIP] live magnet download (pass --live <magnet> to run it)")
+        if live_twice:
+            await test_live_twice(live_twice)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
