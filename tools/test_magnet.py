@@ -1,0 +1,280 @@
+#!/usr/bin/env python3
+"""Magnet link support: metadata reading, progress parsing, live download.
+
+Deterministic checks run offline (synthetic .torrent files, synthetic aria2c
+output).  The live part — resolving a real magnet and pulling bytes — only runs
+when you pass a magnet, so CI stays offline:
+
+    .venv/bin/python tools/test_magnet.py
+    .venv/bin/python tools/test_magnet.py --live "magnet:?xt=urn:btih:..."
+
+Why this exists: the aria2c backend never set the job's name/size/path, showed
+no progress while resolving a magnet, and returned an empty stub for magnet
+metadata when libtorrent was absent.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import shutil
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from omnidownloader.core import torrent_meta  # noqa: E402
+from omnidownloader.core.download_manager import DownloadManager  # noqa: E402
+from omnidownloader.core.models import (  # noqa: E402
+    DownloadJob, DownloadModule, DownloadState,
+)
+from omnidownloader.core.torrent_meta import (  # noqa: E402
+    BencodeError, TorrentFile, read_metadata,
+)
+from omnidownloader.modules.torrent_downloader import (  # noqa: E402
+    HAS_ARIA2C, HAS_LIBTORRENT, TorrentDownloader, _size_to_bytes,
+)
+
+RESULTS: list[tuple[str, bool, str]] = []
+
+
+def check(name: str, ok: bool, detail: str = "") -> None:
+    RESULTS.append((name, ok, detail))
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
+
+
+def bencode(obj) -> bytes:
+    if isinstance(obj, int):
+        return b"i%de" % obj
+    if isinstance(obj, bytes):
+        return b"%d:%s" % (len(obj), obj)
+    if isinstance(obj, str):
+        return bencode(obj.encode())
+    if isinstance(obj, list):
+        return b"l" + b"".join(bencode(i) for i in obj) + b"e"
+    if isinstance(obj, dict):
+        return (b"d" + b"".join(bencode(k) + bencode(v) for k, v in obj.items())
+                + b"e")
+    raise TypeError(type(obj))
+
+
+def make_torrent(tmp: Path, multi: bool) -> Path:
+    if multi:
+        info = {
+            b"name": b"Album", b"piece length": 262144, b"pieces": b"x" * 20,
+            b"files": [
+                {b"length": 1500, b"path": [b"disc1", b"01 - one.mp3"]},
+                {b"length": 2500, b"path": [b"disc1", b"02 - two.mp3"]},
+            ],
+        }
+    else:
+        info = {b"name": b"single.iso", b"length": 4096,
+                b"piece length": 262144, b"pieces": b"y" * 20}
+    blob = bencode({b"announce": b"udp://tracker.example:1337/announce",
+                    b"comment": b"test torrent", b"info": info})
+    path = tmp / ("multi.torrent" if multi else "single.torrent")
+    path.write_bytes(blob)
+    return path
+
+
+def test_metadata_reader(tmp: Path) -> None:
+    single = read_metadata(make_torrent(tmp, multi=False))
+    check("single-file torrent: name and size",
+          single.name == "single.iso" and single.total_size == 4096,
+          f"{single.name} {single.total_size}")
+    check("single-file torrent lists its file",
+          len(single.files) == 1 and single.files[0].length == 4096)
+    check("single-file torrent is not marked multi",
+          not single.is_multi_file)
+
+    multi = read_metadata(make_torrent(tmp, multi=True))
+    check("multi-file torrent sums its files",
+          multi.total_size == 4000 and len(multi.files) == 2,
+          f"{multi.total_size} bytes in {len(multi.files)} files")
+    check("multi-file torrent keeps relative paths",
+          multi.files[1].path == "disc1/02 - two.mp3", multi.files[1].path)
+    check("multi-file torrent is marked multi", multi.is_multi_file)
+    check("metadata converts to the UI dict shape",
+          set(multi.as_dict()) >= {"name", "total_size", "files", "thumbnail"},
+          str(sorted(multi.as_dict())))
+    check("file list is exposed as path/length pairs",
+          multi.as_dict()["files"][0]["path"].startswith("disc1/"))
+
+    junk = tmp / "notatorrent.torrent"
+    junk.write_bytes(b"<!doctype html><html>404</html>")
+    try:
+        read_metadata(junk)
+        check("an HTML error page saved as .torrent is rejected", False, "accepted")
+    except BencodeError as exc:
+        check("an HTML error page saved as .torrent is rejected", True, str(exc)[:50])
+
+
+def test_metadata_discovery(tmp: Path) -> None:
+    """aria2c saves <infohash>.torrent; we must find the newest one."""
+    work = tmp / "work"
+    work.mkdir()
+    (work / "random.torrent").write_bytes(b"d4:infod4:name1:xe e")
+    check("a non-infohash .torrent is ignored",
+          torrent_meta.find_saved_metadata(work) is None)
+    good = work / ("a" * 40 + ".torrent")
+    good.write_bytes(b"d4:infod4:name1:xe e")
+    check("an infohash-named .torrent is found",
+          torrent_meta.find_saved_metadata(work) == good)
+
+
+def test_size_tokens() -> None:
+    cases = {"756MiB": 756 * 1024 ** 2, "1.2GiB": int(1.2 * 1024 ** 3),
+             "512KiB": 524288, "0B": 0, "3MiB/s": 0}
+    ok = all(_size_to_bytes(k) == v for k, v in cases.items())
+    check("aria2c size tokens parse", ok,
+          ", ".join(f"{k}->{_size_to_bytes(k)}" for k in cases))
+
+
+def test_progress_parsing() -> None:
+    mod = TorrentDownloader()
+    job = DownloadJob(url="magnet:?xt=urn:btih:" + "a" * 40,
+                      module=DownloadModule.TORRENT)
+    ticks: list[float] = []
+
+    def cb(j):
+        ticks.append(j.progress_percent)
+
+    # aria2c's FILE: line announces the phase.  The metadata phase reports the
+    # .torrent's own size (59 KiB) as "100%" — that must not be taken as the
+    # payload, or a magnet looks instantly finished at 59 KiB.
+    mod._parse_torrent_progress(
+        job, "FILE: [MEMORY][METADATA]debian-13.7.0-amd64-netinst.iso", cb)
+    check("the metadata phase is announced and named",
+          job.state == DownloadState.EXTRACTING
+          and job.file_name == "debian-13.7.0-amd64-netinst.iso",
+          f"state={job.state.value} name={job.file_name}")
+    mod._parse_torrent_progress(job, "[#3c603c 59KiB/59KiB(100%) CN:32 SD:0]", cb)
+    check("metadata-phase size is not mistaken for the payload",
+          job.file_size == 0 and job.progress_percent == 0.0,
+          f"size={job.file_size} pct={job.progress_percent}")
+
+    mod._parse_torrent_progress(
+        job, "FILE: /tmp/dl/debian-13.7.0-amd64-netinst.iso", cb)
+    mod._parse_torrent_progress(
+        job, "[#1 756MiB/756MiB(50%) CN:4 SD:12 DL:1.2MiB ETA:3m]", cb)
+    check("a transfer line updates percentage",
+          abs(job.progress_percent - 50.0) < 0.01, f"{job.progress_percent}%")
+    check("a transfer line updates size",
+          job.file_size == 792723456, f"{job.file_size}")
+    check("a transfer line updates downloaded bytes",
+          job.downloaded_bytes == int(job.file_size * 0.5), str(job.downloaded_bytes))
+    check("download speed is picked up", job.speed_bps > 0, f"{job.speed_bps:.0f} B/s")
+    check("progress callback fired", len(ticks) >= 2, str(ticks[-3:]))
+    check("the transfer phase follows the metadata phase",
+          mod._phases[job.id] == "transfer", mod._phases[job.id])
+
+
+def test_describe_result(tmp: Path) -> None:
+    """After a download the job must point at the real file, not nothing."""
+    mod = TorrentDownloader(save_path=str(tmp))
+    before = mod._snapshot_dir(tmp)
+    produced = tmp / "debian-13.7.0-amd64-netinst.iso"
+    produced.write_bytes(b"\x00" * 2048)
+    (tmp / (produced.name + ".aria2")).write_bytes(b"ctrl")
+    job = DownloadJob(url="magnet:?xt=urn:btih:" + "b" * 40,
+                      module=DownloadModule.TORRENT)
+    mod._describe_result(job, before)
+    check("the job gets the produced file path",
+          job.file_path == str(produced), job.file_path)
+    check("the job gets a display name", job.file_name == produced.name, job.file_name)
+    check("the job gets a size", job.file_size == 2048, str(job.file_size))
+    check("the aria2 control file is not mistaken for the result",
+          not job.file_path.endswith(".aria2"))
+
+
+async def test_routing() -> None:
+    dm = DownloadManager()
+    dm.register_module(TorrentDownloader())
+    magnet = "magnet:?xt=urn:btih:" + "c" * 40 + "&dn=example"
+    mod = await dm._resolve_module(DownloadJob(url=magnet, module=DownloadModule.UNKNOWN))
+    check("a magnet link routes to the torrent module",
+          mod is not None and getattr(mod, "MODULE_NAME", "") == "torrent",
+          f"{mod.display_name() if mod else 'none'} "
+          f"(libtorrent={HAS_LIBTORRENT} aria2c={HAS_ARIA2C})")
+    check("can_handle accepts magnets",
+          TorrentDownloader().can_handle(magnet))
+
+
+async def test_live(magnet: str, budget: int = 90) -> None:
+    """Resolve a real magnet and pull bytes, then cancel."""
+    mod = TorrentDownloader()
+    meta = await mod.extract_metadata(magnet)
+    check("live: magnet metadata resolves to a name and size",
+          bool(meta.get("name")) and meta.get("name") != "Torrent"
+          and meta.get("total_size", -1) > 0,
+          f"{meta.get('name')!r} {meta.get('total_size')} bytes "
+          f"({len(meta.get('files') or [])} files)")
+
+    tmp = Path(tempfile.mkdtemp(prefix="magnetlive-"))
+    dl = TorrentDownloader(save_path=str(tmp))
+    job = DownloadJob(url=magnet, module=DownloadModule.TORRENT)
+    ticks: list[float] = []
+    task = asyncio.create_task(dl.start_download(job, progress_callback=lambda j: ticks.append(j.progress_percent)))
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        await asyncio.sleep(2)
+        if task.done():
+            break
+        # Drive on *progress*, not the file size on disk: aria2c preallocates
+        # the full file immediately, so size never indicates real progress.
+        if any(t >= 5.0 for t in ticks):
+            break
+    data = sum(p.stat().st_size for p in tmp.rglob("*") if p.is_file())
+    check("live: the magnet downloads real bytes", data > 1024 ** 2,
+          f"{data / 1024 ** 2:.1f} MiB")
+    check("live: progress was reported to the UI", any(t > 0 for t in ticks),
+          f"{len(ticks)} ticks, last={ticks[-1] if ticks else None}")
+    check("live: the job knows its name and size",
+          bool(job.file_name) and job.file_size > 1024 ** 2,
+          f"{job.file_name!r} {job.file_size}")
+    check("live: the file list is available for selective download",
+          bool(job.metadata.get("torrent_files")),
+          f"{len(job.metadata.get('torrent_files') or [])} entries")
+
+    dl._cancel_flags[job.id] = True
+    try:
+        await asyncio.wait_for(task, timeout=30)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+    except Exception as exc:  # noqa: BLE001
+        print("   (cancel raised:", type(exc).__name__, ")")
+    shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def main() -> int:
+    live = ""
+    if "--live" in sys.argv:
+        idx = sys.argv.index("--live")
+        if idx + 1 < len(sys.argv):
+            live = sys.argv[idx + 1]
+
+    tmp = Path(tempfile.mkdtemp(prefix="magnettest-"))
+    try:
+        test_metadata_reader(tmp)
+        test_metadata_discovery(tmp)
+        test_size_tokens()
+        test_progress_parsing()
+        test_describe_result(tmp)
+        await test_routing()
+        if live:
+            await test_live(live)
+        else:
+            print("[SKIP] live magnet download (pass --live <magnet> to run it)")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    failures = [n for n, ok, _ in RESULTS if not ok]
+    print(f"\n{len(RESULTS) - len(failures)}/{len(RESULTS)} checks passed")
+    if failures:
+        print("FAILED: " + ", ".join(failures))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(asyncio.run(main()))

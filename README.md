@@ -11,7 +11,8 @@
 - 📃 **Playlists** — A playlist URL becomes one job per entry, all inheriting the quality you pick once
 - 🔄 **Self-Updating Extractor** — yt-dlp is refreshed automatically (weekly, or from Settings) so broken extractors self-heal
 - 💾 **Persistent Settings** — Download directory, limits, theme, proxy, scheduler rules and history survive restarts
-- 🧲 **Torrent Downloader** — libtorrent integration with DHT and sequential download
+- 🧲 **Torrents & Magnet Links** — magnet links resolve to a real name, size and file
+  list (libtorrent, or aria2c plus the bundled metadata reader), with live progress
 - 🖼️ **Image Scraper** — Batch image gallery downloader with deduplication
 - 🎨 **Dark & Light Mode** — System-aware theme switching with polished QSS stylesheets
 - 📋 **Clipboard Monitor** — Auto-detects copied URLs (including magnets) and prompts to download
@@ -161,6 +162,8 @@ Note that built-ins are *imported*, so packaging them into a frozen bundle (see
 .venv/bin/python tools/test_media_extractor.py    # live YouTube download
 .venv/bin/python tools/test_playlists.py          # playlist → child jobs
 .venv/bin/python tools/test_persistence.py        # config + history
+.venv/bin/python tools/test_magnet.py             # magnet/torrent handling (offline)
+.venv/bin/python tools/test_magnet.py --live "magnet:?xt=urn:btih:..."   # + a real magnet
 .venv/bin/python tools/test_cross_platform.py     # Linux/macOS/Windows behaviour
 QT_QPA_PLATFORM=offscreen .venv/bin/python tools/test_ui_wiring.py
 ```
