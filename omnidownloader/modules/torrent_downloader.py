@@ -381,19 +381,38 @@ class TorrentDownloader(BaseDownloaderModule):
         if self._max_download > 0:
             # ``max_download_rate`` is a KiB/s budget (as the CLI flag expects).
             cmd += ["--max-overall-download-limit", f"{self._max_download}K"]
+
+        proxy = ""
         if self._proxy_manager and self._proxy_manager.enabled:
-            proxy = self._proxy_manager.get_proxy_url()
-            if proxy:
-                cmd += ["--all-proxy", proxy]
-                # SOCKS carries TCP only: DHT, UDP trackers and LPD would leave
-                # the machine directly and defeat the proxy (with Tor enabled
-                # that is a real IP leak).
-                cmd += ["--enable-dht=false", "--bt-enable-lpd=false",
-                        "--disable-ipv6=true", "--bt-tracker-connect-timeout=20"]
-                logger.info(
-                    "Torrent traffic routed through %s — peer connections are "
-                    "slow, and DHT/LPD are disabled to avoid leaks", proxy,
+            proxy = self._proxy_manager.get_proxy_url() or ""
+
+        if proxy.startswith(("http://", "https://", "ftp://")):
+            cmd += ["--all-proxy", proxy]
+            # SOCKS is not involved here, but a proxy cannot carry UDP: DHT,
+            # UDP trackers and LPD would leave the machine directly and expose
+            # the real IP the proxy was meant to hide.
+            cmd += ["--enable-dht=false", "--bt-enable-lpd=false"]
+            logger.info("Torrent traffic routed through the HTTP proxy %s", proxy)
+        elif proxy:
+            # aria2's --all-proxy accepts http/https/ftp only — it has no SOCKS
+            # support at all, and passing socks5:// makes aria2 abort with
+            # "unrecognized protocol" (exit code 28), which broke every torrent
+            # while Tor was enabled.
+            if not os.environ.get("OMNI_ALLOW_TORRENTS_DIRECT"):
+                # The card shows only the first 80 characters, so the action
+                # comes first and the explanation after.
+                raise RuntimeError(
+                    "Tor is on but aria2c cannot use SOCKS: turn Tor off to "
+                    "download torrents (or set OMNI_ALLOW_TORRENTS_DIRECT=1 to "
+                    "go direct and expose your IP). aria2 supports HTTP proxies "
+                    "only; python-libtorrent does support SOCKS."
                 )
+            logger.warning(
+                "Tor/a SOCKS proxy is enabled (%s) but aria2c cannot use SOCKS — "
+                "this torrent will connect directly and expose your real IP",
+                proxy,
+            )
+
         cmd.append(job.url)
         return cmd
 

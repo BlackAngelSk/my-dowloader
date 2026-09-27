@@ -300,31 +300,101 @@ def test_no_peer_detection(tmp: Path) -> None:
 
 
 def test_proxy_routing(tmp: Path) -> None:
-    """With Tor/a proxy set, torrent traffic must not leak direct."""
-    class FakeProxy:
+    """Proxy handling must not break torrents, and must not leak by accident.
+
+    aria2's --all-proxy takes http/https/ftp only — passing a socks5:// URL makes
+    aria2 abort with "unrecognized protocol" (exit 28), which broke every torrent
+    while Tor was enabled.
+    """
+    job = DownloadJob(url="magnet:?xt=urn:btih:" + "a" * 40,
+                      module=DownloadModule.TORRENT)
+
+    class HttpProxy:
         enabled = True
 
         def get_proxy_url(self):
-            return "socks5://127.0.0.1:9050"
+            return "http://127.0.0.1:8118"
 
-    mod = TorrentDownloader(proxy_manager=FakeProxy())
-    job = DownloadJob(url="magnet:?xt=urn:btih:" + "a" * 40,
-                      module=DownloadModule.TORRENT)
-    cmd = mod._aria2_command(job)
-    check("torrents are routed through the proxy",
-          "--all-proxy" in cmd and "socks5://127.0.0.1:9050" in cmd,
-          " ".join(cmd[cmd.index("--all-proxy"):cmd.index("--all-proxy") + 2])
-          if "--all-proxy" in cmd else "MISSING")
-    check("DHT is disabled when proxied (UDP would leak the real IP)",
+    cmd = TorrentDownloader(proxy_manager=HttpProxy())._aria2_command(job)
+    check("an HTTP proxy is passed to aria2c",
+          "--all-proxy" in cmd and "http://127.0.0.1:8118" in cmd,
+          " ".join(cmd[cmd.index("--all-proxy"):cmd.index("--all-proxy") + 2]))
+    check("DHT is disabled behind a proxy (UDP would expose the real IP)",
           "--enable-dht=false" in cmd,
           " ".join(f for f in cmd if "dht" in f.lower()))
-    check("LPD is disabled when proxied",
-          "--bt-enable-lpd=false" in cmd)
+    check("LPD is disabled behind a proxy", "--bt-enable-lpd=false" in cmd)
 
-    plain = TorrentDownloader()
-    plain_cmd = plain._aria2_command(job)
+    class SocksProxy:
+        enabled = True
+
+        def get_proxy_url(self):
+            return "socks5://127.0.0.1:9050"      # Tor
+
+    import os
+
+    tor_mod = TorrentDownloader(proxy_manager=SocksProxy())
+    saved = os.environ.pop("OMNI_ALLOW_TORRENTS_DIRECT", None)
+    try:
+        try:
+            tor_mod._aria2_command(job)
+            refused, message = False, ""
+        except RuntimeError as exc:
+            refused, message = True, str(exc)
+        check("a SOCKS proxy is refused instead of breaking aria2 (exit 28)",
+              refused, message[:90])
+        check("the refusal explains how to proceed",
+              "turn Tor off" in message and "OMNI_ALLOW_TORRENTS_DIRECT" in message,
+              message[:90])
+        check("the actionable part survives the card's 80-char truncation",
+              "turn Tor off" in message[:80], message[:80])
+        check("the refusal never passes socks5 to aria2",
+              "socks5" not in " ".join(
+                  tor_mod._aria2_command(job)) if not refused else True)
+
+        os.environ["OMNI_ALLOW_TORRENTS_DIRECT"] = "1"
+        direct = tor_mod._aria2_command(job)
+        check("the opt-out allows a direct transfer, without --all-proxy",
+              "--all-proxy" not in direct, " ".join(direct[-3:]))
+    finally:
+        os.environ.pop("OMNI_ALLOW_TORRENTS_DIRECT", None)
+        if saved is not None:
+            os.environ["OMNI_ALLOW_TORRENTS_DIRECT"] = saved
+
+    plain_cmd = TorrentDownloader()._aria2_command(job)
     check("without a proxy DHT stays enabled",
           "--enable-dht=true" in plain_cmd and "--all-proxy" not in plain_cmd)
+
+
+def test_no_unknown_options(tmp: Path) -> None:
+    """Every flag passed to aria2c must exist in the installed build.
+
+    Exit 28 ("aria2 rejected an option it was given") is what a bad flag looks
+    like to the user, and it is invisible otherwise.
+    """
+    import subprocess
+
+    if not HAS_ARIA2C:
+        return
+    mod = TorrentDownloader(save_path=str(tmp))
+    job = DownloadJob(url="magnet:?xt=urn:btih:" + "c" * 40,
+                      module=DownloadModule.TORRENT)
+    argv = mod._aria2_command(job)
+    flags = [a for a in argv if a.startswith("--") and "=" in a]
+    # --dir and friends take a separate value; only check the self-contained ones.
+    flags.append("--allow-overwrite=true")   # already present, kept explicit
+
+    bad: list[str] = []
+    for flag in dict.fromkeys(flags):
+        result = subprocess.run(
+            ["aria2c", flag, "--dry-run=true", "--file-allocation=none",
+             "http://127.0.0.1:1/nothing"],
+            capture_output=True, text=True, timeout=30,
+            **platform_utils.subprocess_kwargs())
+        output = (result.stdout + result.stderr).lower()
+        if "unrecognized" in output or "unknown option" in output:
+            bad.append(flag)
+    check("no flag passed to aria2c is rejected by this build", not bad,
+          "; ".join(bad) or f"{len(set(flags))} flags checked")
 
 
 def test_duplicate_guard() -> None:
@@ -494,6 +564,7 @@ async def main() -> int:
         test_infohash(tmp)
         test_no_peer_detection(tmp)
         test_proxy_routing(tmp)
+        test_no_unknown_options(tmp)
         test_duplicate_guard()
         test_describe_result(tmp)
         await test_routing()
