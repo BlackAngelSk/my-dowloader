@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import os
-import sys
+import logging
 from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
-    QApplication, QHBoxLayout, QMainWindow, QPushButton, QSizePolicy,
+    QHBoxLayout, QMainWindow, QPushButton,
     QStackedWidget, QVBoxLayout, QWidget,
 )
 
+from omnidownloader.core import platform_utils
 from omnidownloader.core.download_manager import DownloadManager
-from omnidownloader.core.models import DownloadJob, DownloadState, DownloadModule
+from omnidownloader.core.models import DownloadJob
 from omnidownloader.ui.themes import (
     DARK_COLORS, LIGHT_COLORS, generate_stylesheet, get_system_theme,
 )
@@ -27,6 +27,8 @@ from omnidownloader.ui.widgets.toast_notification import ToastNotification
 from omnidownloader.ui.widgets.media_player import MediaPreviewWidget
 from omnidownloader.ui.widgets.format_dialog import FormatSelectionDialog
 from omnidownloader.ui.drag_drop_overlay import DragDropOverlay
+
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -127,6 +129,8 @@ class MainWindow(QMainWindow):
         self._dm.job_progress.connect(self._on_job_progress)
         self._dm.global_speed_update.connect(self._dashboard.update_global_speed)
         self._dashboard.url_submitted.connect(self._on_url_submitted)
+        self._dashboard.url_submitted_with_checksum.connect(
+            self._on_url_submitted_with_checksum)
         self._dashboard.open_folder_requested.connect(self._on_open_folder)
         self._dashboard.pause_requested.connect(self._dm.pause_job)
         self._dashboard.resume_requested.connect(self._dm.resume_job)
@@ -139,8 +143,9 @@ class MainWindow(QMainWindow):
         self._settings.settings_changed.connect(self._on_settings_changed)
         self._history.open_folder_clicked.connect(self._on_open_folder)
         self._history.remove_clicked.connect(self._on_remove_history)
-        # Scheduler
-        self._scheduler_page.rules_changed.connect(self._on_scheduler_rules_changed)
+        # Scheduler rules are applied by main.py's _apply_scheduler_rules
+        # against the scheduler instance; connecting them here as well applied
+        # every rule edit twice.
         # Media player
         self._media_player.closed.connect(self._on_media_player_closed)
         # Format selection
@@ -156,10 +161,16 @@ class MainWindow(QMainWindow):
                 style.polish(btn)
 
     def _toggle_theme(self) -> None:
-        self._theme = "light" if self._theme == "dark" else "dark"
+        self._set_theme("light" if self._theme == "dark" else "dark")
+
+    def _set_theme(self, theme: str) -> None:
+        """Switch to *theme* and reflect it in the header button."""
+        if theme not in ("dark", "light"):
+            return
+        self._theme = theme
         self._apply_theme()
         self._theme_btn.setText(
-            "\U0001f319  Dark Mode" if self._theme == "dark" else "\u2600\ufe0f  Light Mode"
+            "\U0001f319  Dark Mode" if theme == "dark" else "\u2600\ufe0f  Light Mode"
         )
 
     def _apply_theme(self) -> None:
@@ -169,6 +180,12 @@ class MainWindow(QMainWindow):
 
     def _on_url_submitted(self, url: str) -> None:
         self._dm.enqueue(url)
+
+    def _on_url_submitted_with_checksum(self, url: str, checksum: str) -> None:
+        """Enqueue a URL that carries an expected digest."""
+        job = self._dm.enqueue(url)
+        job.metadata["expected_checksum"] = checksum
+        logger.info("Queued %s with %s verification", url, checksum.split(":")[0])
 
     def _on_files_dropped(self, files: list[str]) -> None:
         for f in files:
@@ -202,24 +219,40 @@ class MainWindow(QMainWindow):
         if "download_dir" in settings and settings["download_dir"]:
             self._dm.download_dir = settings["download_dir"]
         if "max_concurrent" in settings:
-            self._dm._max_concurrent = settings["max_concurrent"]
+            try:
+                self._dm.set_max_concurrent(int(settings["max_concurrent"]))
+            except (TypeError, ValueError):
+                pass
         if "speed_limit_kbs" in settings:
             try:
                 val = float(settings["speed_limit_kbs"] or "0") * 1024
                 self._dm.bandwidth_manager.set_global_rate(val)
             except ValueError:
                 pass
+        # Per-task cap was collected by the settings panel but never applied.
+        if "per_task_limit_kbs" in settings:
+            try:
+                val = float(settings["per_task_limit_kbs"] or "0") * 1024
+                self._dm.set_default_task_rate(val)
+            except (TypeError, ValueError):
+                pass
+        # Theme was collected and dropped: selecting Dark/Light did nothing.
+        theme = settings.get("theme")
+        if theme in ("dark", "light") and theme != self._theme:
+            self._theme = theme
+            self._apply_theme()
 
     def _on_open_folder(self, job_id: str) -> None:
         job = self._dm.get_job(job_id)
-        if job and job.file_path:
-            path = Path(job.file_path).parent
-            if sys.platform == "linux":
-                os.system(f'xdg-open "{path}"')
-            elif sys.platform == "darwin":
-                os.system(f'open "{path}"')
-            else:
-                os.system(f'explorer "{path}"')
+        if not (job and job.file_path):
+            return
+        path = Path(job.file_path)
+        # Open the containing folder for files, the folder itself for dirs.
+        target = path if path.is_dir() else path.parent
+        # Platform_utils open_path: no shell (a directory name containing
+        # quotes or $(...) used to break out of the xdg-open command line),
+        # correct launcher per OS, and no console flash on Windows.
+        platform_utils.open_path(target)
 
     def _on_remove_history(self, job_id: str) -> None:
         self._history.remove_job(job_id)
@@ -237,14 +270,6 @@ class MainWindow(QMainWindow):
 
     def show_toast(self, url: str) -> None:
         self._toast.show_for_url(url)
-
-    def _on_scheduler_rules_changed(self, rules: list) -> None:
-        """Apply scheduler rules to the DownloadManager's scheduler."""
-        from omnidownloader.core.scheduler import SchedulerRule
-        if self._dm._scheduler:
-            self._dm._scheduler.clear_rules()
-            for r in rules:
-                self._dm._scheduler.add_rule(SchedulerRule.from_dict(r))
 
     def _on_media_player_closed(self) -> None:
         self._media_player.hide()

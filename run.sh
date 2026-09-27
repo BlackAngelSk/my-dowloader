@@ -9,7 +9,9 @@ if [ ! -d "$VENV_DIR" ]; then
     echo "Creating virtual environment..."
     python3 -m venv "$VENV_DIR"
     "$VENV_DIR/bin/pip" install --upgrade pip
-    "$VENV_DIR/bin/pip" install -e ".[torrent]"
+    # libtorrent is optional and often needs system packages to build, so a
+    # failure there must not abort first-run setup (set -e is on).
+    "$VENV_DIR/bin/pip" install -e ".[torrent]" || "$VENV_DIR/bin/pip" install -e .
     echo "Dependencies installed."
 fi
 

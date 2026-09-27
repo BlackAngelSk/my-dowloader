@@ -61,8 +61,21 @@ if errorlevel 1 (
 )
 echo.
 
-REM ── Step 3: Read version from pyproject.toml ────────────────
-echo [3/4] Reading version...
+REM ── Step 3: Smoke-test the frozen app ───────────────────────
+echo [3/5] Smoke-testing the frozen app...
+"dist\OmniDownloader\OmniDownloader.exe" --diagnose > "%TEMP%\omni-diagnose.txt" 2>&1
+findstr /C:"no download modules loaded" "%TEMP%\omni-diagnose.txt" >nul 2>&1
+if not errorlevel 1 (
+    echo ERROR: The bundle loaded no download modules - nothing would download.
+    echo See %TEMP%\omni-diagnose.txt
+    pause
+    exit /b 1
+)
+echo     Modules and routing OK.
+echo.
+
+REM ── Step 4: Read version from pyproject.toml ────────────────
+echo [4/5] Reading version...
 set "VERSION=0.1.0"
 for /f "tokens=2 delims==" %%A in ('findstr /B "version" pyproject.toml 2^>nul') do (
     set "RAW=%%~A"
@@ -72,8 +85,8 @@ for /f "tokens=2 delims==" %%A in ('findstr /B "version" pyproject.toml 2^>nul')
 echo Current version: %VERSION%
 echo.
 
-REM ── Step 4: Inno Setup installer ────────────────────────────
-echo [4/4] Building installer with Inno Setup...
+REM ── Step 5: Inno Setup installer ────────────────────────────
+echo [5/5] Building installer with Inno Setup...
 where iscc >nul 2>&1
 if errorlevel 1 (
     echo WARNING: Inno Setup (iscc) not found in PATH.

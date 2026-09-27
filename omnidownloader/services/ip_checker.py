@@ -42,8 +42,17 @@ class IPChecker:
         self._cache_seconds = cache_seconds
         self._cached: Optional[IPCheckResult] = None
 
+    def _cache_valid(self) -> bool:
+        """True while the cached result is younger than ``cache_seconds``."""
+        return (
+            self._cached is not None
+            and (time.time() - self._cached.checked_at) <= self._cache_seconds
+        )
+
     async def check(self, proxy_url: str = "") -> IPCheckResult:
-        if self._cached and not self._cached.is_stale and not proxy_url:
+        # Honour ``cache_seconds`` (the hard-coded is_stale ignored it), and
+        # never serve a cached answer for a different proxy configuration.
+        if (self._cache_valid() and not proxy_url and self._cached is not None):
             return self._cached
 
         connector = None

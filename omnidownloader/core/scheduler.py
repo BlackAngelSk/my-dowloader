@@ -32,15 +32,21 @@ class SchedulerRule:
     enabled: bool = True
 
     def matches(self, now: dt_time) -> bool:
-        """Check if *now* falls within this rule's time window."""
+        """Check if *now* falls within this rule's half-open window [start, end).
+
+        Half-open so back-to-back rules (08:00–02:00 then 02:00–08:00) can
+        never both claim the same instant.
+        """
         if not self.enabled:
             return False
         start = dt_time(self.start_hour, self.start_minute)
         end = dt_time(self.end_hour, self.end_minute)
-        if start <= end:
-            return start <= now <= end
-        else:
-            return now >= start or now <= end
+        if start < end:
+            return start <= now < end
+        if start > end:
+            return now >= start or now < end
+        # start == end: an empty window unless it covers the whole day
+        return start == dt_time(0, 0)
 
     def to_dict(self) -> dict:
         return {
@@ -148,11 +154,15 @@ class BandwidthScheduler(QObject):
         if matched is not None and matched is not self._active_rule:
             self._active_rule = matched
             self._bw.set_global_rate(matched.global_speed_limit)
+            # per_task_speed_limit was stored and round-tripped but never
+            # applied — the rule's per-download cap did nothing.
+            self._bw.set_all_task_rates(matched.per_task_speed_limit)
             logger.info("Scheduler: activated rule '%s'", matched.name)
             self.rule_changed.emit(matched.name)
         elif matched is None and self._active_rule is not None:
             self._active_rule = None
             self._bw.set_global_rate(0.0)
+            self._bw.set_all_task_rates(0.0)
             logger.info("Scheduler: no active rule, speed unlimited")
             self.rule_changed.emit("")
 

@@ -68,17 +68,33 @@ class ToastNotification(QWidget):
         self._url = url
         display = url[:50] + "…" if len(url) > 50 else url
         self._desc.setText(display)
+        # A toast is also used for plain notices ("up to date ✓"); offering a
+        # Download button for those enqueued invisible non-URLs as real jobs.
+        self._download_btn.setEnabled(self._looks_downloadable(url))
 
-        # Position at top-right of parent
+        # Position at the top-right of the parent — a Qt.Tool window lives in
+        # screen coordinates, so the parent's width is not a position.
         parent = self.parent()
         if parent is not None:
+            from PyQt6.QtCore import QPoint
             from PyQt6.QtWidgets import QWidget
-            pw = parent.width() if isinstance(parent, QWidget) else self.width()
-            self.move(pw - self.width() - 20, 20)
+            if isinstance(parent, QWidget):
+                corner = parent.mapToGlobal(
+                    QPoint(parent.width() - self.width() - 20, 20)
+                )
+                self.move(corner)
+            else:
+                self.move(20, 20)
 
         self.show()
         self.raise_()
         self._timer.start(auto_dismiss_ms)
+
+    @staticmethod
+    def _looks_downloadable(text: str) -> bool:
+        """True for things worth offering a Download button for."""
+        lowered = text.strip().lower()
+        return lowered.startswith(("http://", "https://", "magnet:"))
 
     def _on_download(self) -> None:
         self.download_clicked.emit(self._url)

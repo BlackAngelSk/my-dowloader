@@ -23,8 +23,9 @@ class SpeedGraph(QWidget):
 
     def add_sample(self, speed_bps: float) -> None:
         self._data.append(speed_bps)
-        if speed_bps > self._max_speed:
-            self._max_speed = speed_bps * 1.2
+        # Recompute from the visible window every time: a single spike used to
+        # pin the axis forever, flattening the live line against the bottom.
+        self._max_speed = max(max(self._data, default=1.0) * 1.2, 1024.0)
         self.update()
 
     def set_accent_color(self, color: str) -> None:

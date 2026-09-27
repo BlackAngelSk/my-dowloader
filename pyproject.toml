@@ -17,5 +17,8 @@ dependencies = [
 omnidownloader = "omnidownloader.main:main"
 
 [project.optional-dependencies]
-torrent = ["python-libtorrent"]
+# Optional: torrent support.  The PyPI distribution is "libtorrent"; it may
+# need system libtorrent-rasterbar/boost to build, which is why run.sh treats
+# this extra as best-effort.  aria2c is the fallback engine.
+torrent = ["libtorrent>=2.0.0"]
 dev = ["pytest", "ruff"]

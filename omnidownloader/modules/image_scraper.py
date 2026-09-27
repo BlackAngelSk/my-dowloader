@@ -111,10 +111,15 @@ class ImageScraper(BaseDownloaderModule):
             try:
                 async with session.get(img["url"]) as resp:
                     if resp.status == 200:
-                        data = await resp.read()
-                        filepath.write_bytes(data)
+                        # Stream to disk: read() pulled each image fully into
+                        # memory, which is a real problem for large galleries.
+                        written = 0
+                        with open(filepath, "wb") as fh:
+                            async for chunk in resp.content.iter_chunked(256 * 1024):
+                                fh.write(chunk)
+                                written += len(chunk)
                         success += 1
-                        job.mark_downloaded(len(data))
+                        job.mark_downloaded(written)
                         job.progress_percent = ((idx + 1) / len(unique)) * 100
                         if progress_callback:
                             progress_callback(job)
@@ -155,8 +160,19 @@ class ImageScraper(BaseDownloaderModule):
             if self._proxy_manager and self._proxy_manager.enabled:
                 connector = self._proxy_manager.get_aiohttp_connector()
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"}
-            kwargs: dict = {"timeout": aiohttp.ClientTimeout(total=30), "headers": headers}
+            # ``total`` covers the whole response body, so a 30 s total aborted
+            # any gallery that took longer than that to download.
+            kwargs: dict = {
+                "timeout": aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60),
+                "headers": headers,
+            }
             if connector:
                 kwargs["connector"] = connector
             self._session = aiohttp.ClientSession(**kwargs)
         return self._session
+
+    async def close(self) -> None:
+        """Release the aiohttp session (otherwise it leaks on exit)."""
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None

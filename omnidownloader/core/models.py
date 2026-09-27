@@ -111,28 +111,47 @@ class DownloadJob:
             "error_message": self.error_message,
             "file_name": self.file_name, "file_path": self.file_path,
             "file_size": self.file_size, "downloaded_bytes": self.downloaded_bytes,
-            "speed_bps": self.speed_bps, "thread_count": self.thread_count,
+            "speed_bps": self.speed_bps, "avg_speed_bps": self.avg_speed_bps,
+            "max_speed_bps": self.max_speed_bps, "thread_count": self.thread_count,
             "priority": self.priority.value,
             "sequential": self.sequential,
+            "segments": [
+                {"segment_index": s.segment_index, "start_byte": s.start_byte,
+                 "end_byte": s.end_byte, "downloaded_bytes": s.downloaded_bytes,
+                 "speed_bps": s.speed_bps, "completed": s.completed}
+                for s in self.segments
+            ],
             "metadata": self.metadata, "created_at": self.created_at,
             "started_at": self.started_at, "completed_at": self.completed_at,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> DownloadJob:
+        """Rebuild a job, tolerating unknown module/state/priority strings.
+
+        The old version raised ValueError on any value outside the enums, and
+        dropped the speed and segment fields on the way back in.
+        """
         return cls(
             id=data.get("id", uuid.uuid4().hex[:12]),
             url=data.get("url", ""),
-            module=DownloadModule(data.get("module", "unknown")),
-            state=DownloadState(data.get("state", "pending")),
+            module=DownloadModule._value2member_map_.get(
+                data.get("module", "unknown"), DownloadModule.UNKNOWN),
+            state=DownloadState._value2member_map_.get(
+                data.get("state", "pending"), DownloadState.PENDING),
             error_message=data.get("error_message"),
             file_name=data.get("file_name", ""),
             file_path=data.get("file_path", ""),
             file_size=data.get("file_size", 0),
             downloaded_bytes=data.get("downloaded_bytes", 0),
+            speed_bps=data.get("speed_bps", 0.0),
+            avg_speed_bps=data.get("avg_speed_bps", 0.0),
+            max_speed_bps=data.get("max_speed_bps", 0.0),
             thread_count=data.get("thread_count", 0),
-            priority=Priority(data.get("priority", "normal")),
+            priority=Priority._value2member_map_.get(
+                data.get("priority", "normal"), Priority.NORMAL),
             sequential=data.get("sequential", False),
+            segments=[SegmentProgress(**s) for s in data.get("segments", [])],
             metadata=data.get("metadata", {}),
             created_at=data.get("created_at", time.time()),
             started_at=data.get("started_at"),
@@ -173,7 +192,14 @@ class DownloadJob:
         return remaining / self.speed_bps
 
     @property
-    def elapsed_seconds(self) -> float:
-        start = self.started_at or self.created_at
-        end = self.completed_at or time.monotonic()
-        return max(0.0, end - start)
+    def elapsed_seconds(self) -> Optional[float]:
+        """Seconds spent downloading, or ``None`` before the job starts.
+
+        ``started_at``/``completed_at`` are monotonic clocks while
+        ``created_at`` is wall-clock, so the old implementation returned a
+        meaningless (negative, clamped-to-zero) number for queued jobs.
+        """
+        if self.started_at is None:
+            return None
+        end = self.completed_at if self.completed_at is not None else time.monotonic()
+        return max(0.0, end - self.started_at)

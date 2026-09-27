@@ -89,7 +89,10 @@ class DownloadCard(QFrame):
         self._pause_btn = QPushButton("\u23f8")
         self._pause_btn.setObjectName("iconButton")
         self._pause_btn.setFixedSize(32, 32)
-        self._pause_btn.clicked.connect(lambda: self.pause_clicked.emit(self._job.id))
+        # One button toggles both ways: it used to always emit pause_clicked,
+        # so a paused download could never be resumed from the card (the
+        # resume path's state guard made it a silent no-op).
+        self._pause_btn.clicked.connect(self._on_pause_or_resume)
         self._cancel_btn = QPushButton("\u23f9")
         self._cancel_btn.setObjectName("iconButton")
         self._cancel_btn.setFixedSize(32, 32)
@@ -183,10 +186,17 @@ class DownloadCard(QFrame):
         self._pause_btn.setEnabled(active or paused)
         self._cancel_btn.setEnabled(active or paused or j.state == DownloadState.PENDING)
         self._open_btn.setEnabled(j.state == DownloadState.COMPLETED)
+        # Media jobs never get a StreamingBuffer (yt-dlp owns the file), so
+        # requiring one disabled Preview for exactly the content it is for.
         self._preview_btn.setEnabled(
             j.state in (DownloadState.DOWNLOADING, DownloadState.COMPLETED)
-            and j.streaming_buffer is not None
         )
+
+    def _on_pause_or_resume(self) -> None:
+        if self._job.state == DownloadState.PAUSED:
+            self.resume_clicked.emit(self._job.id)
+        else:
+            self.pause_clicked.emit(self._job.id)
 
     def _on_priority_changed(self, text: str) -> None:
         val = text.lower()

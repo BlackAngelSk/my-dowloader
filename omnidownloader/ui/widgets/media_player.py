@@ -18,6 +18,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from omnidownloader.core import platform_utils
+
 logger = logging.getLogger(__name__)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".webm", ".mov"}
@@ -49,6 +51,8 @@ class MediaPreviewWidget(QFrame):
         self._job = None
         self._timer: Optional[QTimer] = None
         self._last_read_pos = 0
+        self._preview_source_bytes = -1
+        self._cached_pixmap = None
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -91,9 +95,14 @@ class MediaPreviewWidget(QFrame):
         root.addLayout(controls)
 
     def attach_job(self, job) -> None:
+        # Detach first: re-attaching used to create a second QTimer while the
+        # old one kept polling, so N previews meant N timers running.
+        self.detach()
         self._job = job
         self._streaming_buffer = getattr(job, "streaming_buffer", None)
         self._last_read_pos = 0
+        self._preview_source_bytes = -1
+        self._cached_pixmap = None
         self._title_lbl.setText(job.file_name or "Media Preview")
         fname = job.file_name or job.url
         if _is_image(fname):
@@ -134,33 +143,36 @@ class MediaPreviewWidget(QFrame):
         if not self._streaming_buffer:
             return
         try:
-            data = self._streaming_buffer.read(0, min(5*1024*1024, self._streaming_buffer.available_bytes()))
-            if data:
-                pixmap = QPixmap()
-                pixmap.loadFromData(data)
-                if not pixmap.isNull():
-                    scaled = pixmap.scaled(
-                        self._player_area.size(),
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                    self._player_area.setPixmap(scaled)
+            avail = self._streaming_buffer.available_bytes()
+            # Re-read and rescale only when the available prefix actually
+            # changed — this used to pull up to 5 MB and run a smooth rescale
+            # on every 1 Hz tick while a large image was downloading.
+            if avail == self._preview_source_bytes and self._cached_pixmap is not None:
+                return
+            data = self._streaming_buffer.read(0, min(5 * 1024 * 1024, avail))
+            if not data:
+                return
+            fresh = QPixmap()
+            fresh.loadFromData(data)
+            if fresh.isNull():
+                return
+            self._cached_pixmap = fresh
+            self._preview_source_bytes = avail
+            scaled = self._cached_pixmap.scaled(
+                self._player_area.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self._player_area.setPixmap(scaled)
         except Exception as exc:
             logger.debug("Image preview failed: %s", exc)
 
     def _open_external(self) -> None:
         if not self._job or not self._job.file_path:
             return
-        import subprocess, sys
-        try:
-            if sys.platform == "linux":
-                subprocess.Popen(["xdg-open", self._job.file_path])
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", self._job.file_path])
-            else:
-                subprocess.Popen(["cmd", "/c", "start", self._job.file_path])
-        except Exception as exc:
-            logger.warning("Failed to open media: %s", exc)
+        # Same helper as the "open folder" action: `cmd /c start` broke on
+        # paths with spaces and flashed a console window on Windows.
+        platform_utils.open_path(self._job.file_path, reveal=True)
 
     def _on_close(self) -> None:
         self.detach()

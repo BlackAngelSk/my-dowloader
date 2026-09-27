@@ -8,9 +8,10 @@ from typing import Optional
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QWidget
 
-# Regex for common URLs
+# Regex for common URLs — magnet links are matched too: _is_downloadable()
+# has always had a magnet branch that this regex could never reach.
 URL_RE = re.compile(
-    r'https?://[^\s<>"\')\]]+',
+    r'(https?://[^\s<>"\'\]]+|magnet:\?[^\s<>"\']+)',
     re.IGNORECASE,
 )
 

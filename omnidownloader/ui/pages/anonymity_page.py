@@ -11,12 +11,19 @@ class AnonymityPage(QWidget):
     proxy_config_changed = pyqtSignal(dict)
     tor_toggle = pyqtSignal(bool)
     kill_switch_toggle = pyqtSignal(bool)
+    kill_switch_interval_changed = pyqtSignal(int)
     ip_check_requested = pyqtSignal()
     tor_rotate_requested = pyqtSignal()
+    #: Emitted from the asyncio engine thread; connected to the QLabel
+    #: updaters below so widget mutation always happens on the GUI thread.
+    ip_info_ready = pyqtSignal(str, str, str)
+    tor_status_ready = pyqtSignal(bool, bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._build_ui()
+        self.ip_info_ready.connect(self.update_ip_info)
+        self.tor_status_ready.connect(self.update_tor_status)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -76,6 +83,14 @@ class AnonymityPage(QWidget):
         pg.setLayout(pf)
         root.addWidget(pg)
 
+        # Apply edits live — without this, changing host/port while the proxy
+        # is ON had no effect until the user toggled it off and on again.
+        self._proxy_type.currentTextChanged.connect(self._on_proxy_field_changed)
+        self._proxy_host.editingFinished.connect(self._on_proxy_field_changed)
+        self._proxy_user.editingFinished.connect(self._on_proxy_field_changed)
+        self._proxy_pass.editingFinished.connect(self._on_proxy_field_changed)
+        self._proxy_port.valueChanged.connect(self._on_proxy_field_changed)
+
         # Tor
         tg = QGroupBox("Tor Network")
         tf = QFormLayout()
@@ -108,6 +123,9 @@ class AnonymityPage(QWidget):
         kf.addRow("Check Interval:", self._kill_interval)
         kg.setLayout(kf)
         root.addWidget(kg)
+        # The interval spinbox had no connection at all — changing it did
+        # nothing.  Emit it so the proxy manager can honour it.
+        self._kill_interval.valueChanged.connect(self.kill_switch_interval_changed.emit)
 
         # DNS
         dg = QGroupBox("DNS Leak Protection")
@@ -122,9 +140,17 @@ class AnonymityPage(QWidget):
     def _on_proxy_toggled(self):
         enabled = self._proxy_enabled.isChecked()
         self._proxy_enabled.setText("ON" if enabled else "OFF")
+        self._emit_proxy_config()
+
+    def _on_proxy_field_changed(self):
+        """Re-apply proxy settings when a field is edited while enabled."""
+        if self._proxy_enabled.isChecked():
+            self._emit_proxy_config()
+
+    def _emit_proxy_config(self):
         type_map = {"SOCKS5": "socks5", "SOCKS4": "socks4", "HTTP": "http", "HTTPS": "https"}
         self.proxy_config_changed.emit({
-            "enabled": enabled,
+            "enabled": self._proxy_enabled.isChecked(),
             "proxy_type": type_map.get(self._proxy_type.currentText(), "socks5"),
             "host": self._proxy_host.text(),
             "port": self._proxy_port.value(),
@@ -140,6 +166,9 @@ class AnonymityPage(QWidget):
     def _on_kill_toggled(self):
         enabled = self._kill_btn.isChecked()
         self._kill_btn.setText("ON" if enabled else "OFF")
+        # Reflect the change immediately (GUI thread) — update_kill_status()
+        # had no caller at all, so the label stayed "Inactive" forever.
+        self.update_kill_status(enabled)
         self.kill_switch_toggle.emit(enabled)
 
     def update_ip_info(self, ip, country, isp):

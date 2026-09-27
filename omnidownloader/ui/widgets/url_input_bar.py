@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import re
+
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QWidget
+
+#: "https://… sha256:abc…" — an expected digest typed after the URL.
+CHECKSUM_RE = re.compile(r"\b(sha256|sha512|sha1|md5):([0-9a-fA-F]{32,128})\b")
 
 
 class URLInputBar(QWidget):
     """Top-bar URL input with paste and download trigger."""
 
     url_submitted = pyqtSignal(str)
+    #: URL plus an expected checksum, when one was supplied.
+    url_with_checksum = pyqtSignal(str, str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -60,7 +67,29 @@ class URLInputBar(QWidget):
                 self._input.setText(text.strip())
 
     def _on_submit(self) -> None:
-        url = self._input.text().strip()
-        if url:
+        url, checksum = self.parse_input(self._input.text())
+        if not url:
+            return
+        if checksum:
+            self.url_with_checksum.emit(url, checksum)
+        else:
             self.url_submitted.emit(url)
-            self._input.clear()
+        self._input.clear()
+
+    @staticmethod
+    def parse_input(text: str) -> tuple[str, str]:
+        """Split ``"<url> sha256:<hex>"`` into (url, checksum).
+
+        Checksums are optional: paste ``https://host/file.iso sha256:abc…``
+        and the digest is verified once the download finishes.
+        """
+        raw = (text or "").strip()
+        if not raw:
+            return "", ""
+        checksum = ""
+        match = CHECKSUM_RE.search(raw)
+        if match:
+            checksum = f"{match.group(1).lower()}:{match.group(2).lower()}"
+            raw = (raw[:match.start()] + " " + raw[match.end():]).strip()
+        url = raw.split()[0] if raw.split() else ""
+        return url, checksum

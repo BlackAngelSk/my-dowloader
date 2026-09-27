@@ -7,12 +7,13 @@ Displays all available formats from yt-dlp metadata in a tabbed view
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Optional
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
+    QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QListWidget, QListWidgetItem,
     QPushButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -46,6 +47,28 @@ def _parse_height(res: str) -> int:
         return 0
 
 
+def _codec(value) -> str:
+    """Normalise a yt-dlp codec field to a string.
+
+    Extractors differ: YouTube sends the string ``"none"`` for a missing
+    stream, others send JSON ``null``.  Passing ``None`` through made an
+    audio-only format look like a *video* one (``None not in ("none", "")`` is
+    True), so the Audio tab came up empty and a bogus "0p" row appeared in the
+    Video tab — i.e. "I can't download only audio, there's nothing".
+    """
+    if value is None:
+        return "none"
+    text = str(value).strip()
+    return text or "none"
+
+
+def _is_storyboard(fmt: dict) -> bool:
+    """True for image-sheet "formats" (storyboards), which are not downloads."""
+    proto = str(fmt.get("protocol") or "").lower()
+    ext = str(fmt.get("ext") or "").lower()
+    return proto == "mhtml" or ext == "mhtml"
+
+
 class FormatEntry:
     """Structured representation of a single yt-dlp format."""
 
@@ -54,19 +77,36 @@ class FormatEntry:
         self.ext: str = fmt.get("ext", "")
         self.resolution: str = fmt.get("resolution", "audio only")
         self.filesize: int = fmt.get("filesize") or fmt.get("filesize_approx", 0)
-        self.vcodec: str = fmt.get("vcodec", "none")
-        self.acodec: str = fmt.get("acodec", "none")
+        self.vcodec: str = _codec(fmt.get("vcodec"))
+        self.acodec: str = _codec(fmt.get("acodec"))
         self.fps: float = fmt.get("fps") or 0
         # Use native height from yt-dlp, fallback to parsing resolution string
         self.height: int = fmt.get("height", 0) or _parse_height(fmt.get("resolution", ""))
         self.abr: float = fmt.get("abr") or 0
-        # A format is audio-only if it has no video codec
-        self.audio_only: bool = self.vcodec in ("none", "")
+        self.format_note: str = fmt.get("format_note", "") or ""
+        self.protocol: str = fmt.get("protocol", "") or ""
+        # Audio-only means "no video stream", but it must actually carry audio:
+        # some extractors return formats with neither, which must not be
+        # offered as a download (they produced an empty file).
+        self.audio_only: bool = (self.vcodec in ("none", "")
+                                 and self.acodec not in ("none", ""))
 
     @property
     def is_video(self) -> bool:
         # Video if it has a video codec OR a known height
         return (self.vcodec not in ("none", "")) or self.height > 0
+
+    @property
+    def is_storyboard(self) -> bool:
+        """Image sheets ("storyboards") — never a real download target."""
+        return _is_storyboard({"protocol": self.protocol, "ext": self.ext})
+
+    @property
+    def is_downloadable(self) -> bool:
+        """False for storyboards and for formats with no stream at all."""
+        if self.is_storyboard:
+            return False
+        return self.is_video or self.audio_only
 
     @property
     def label(self) -> str:
@@ -139,6 +179,10 @@ class FormatItemWidget(QFrame):
 class FormatSelectionDialog(QDialog):
     """Modal dialog for selecting download quality from yt-dlp formats."""
 
+    #: Emitted from the thumbnail worker thread; Qt queues it to the GUI
+    #: thread, where the QPixmap is built.
+    thumbnail_ready = pyqtSignal(bytes)
+
     def __init__(self, metadata: dict, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Select Download Quality")
@@ -149,8 +193,33 @@ class FormatSelectionDialog(QDialog):
         self._result_data: dict = {}
         self._selected_id: Optional[str] = None
         self._entries: dict[str, FormatEntry] = {}
+        self._thumb_label = None
+        self._thumb_thread: Optional[threading.Thread] = None
+        self.thumbnail_ready.connect(self._apply_thumbnail)
         self._build_ui()
         self._populate_formats()
+
+    def _fetch_thumbnail(self, url: str) -> None:
+        """Fetch thumbnail bytes off the GUI thread."""
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=8) as resp:
+                data = resp.read(5 * 1024 * 1024)
+        except Exception as exc:  # noqa: BLE001 - a missing thumb is cosmetic
+            logger.debug("Thumbnail fetch failed for %s: %s", url, exc)
+            return
+        self.thumbnail_ready.emit(data)
+
+    def _apply_thumbnail(self, data: bytes) -> None:
+        """Build the pixmap on the GUI thread (QPixmap is not thread-safe)."""
+        if not data or self._thumb_label is None:
+            return
+        pixmap = QPixmap()
+        pixmap.loadFromData(data)
+        if not pixmap.isNull():
+            self._thumb_label.setPixmap(pixmap.scaled(
+                120, 68, Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
 
     @property
     def result_data(self) -> dict:
@@ -169,17 +238,14 @@ class FormatSelectionDialog(QDialog):
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumb.setStyleSheet("font-size: 28px; background-color: #111827; border-radius: 6px;")
         if self._metadata.get("thumbnail"):
-            try:
-                import urllib.request
-                data = urllib.request.urlopen(self._metadata["thumbnail"], timeout=5).read()
-                pixmap = QPixmap()
-                pixmap.loadFromData(data)
-                if not pixmap.isNull():
-                    thumb.setPixmap(pixmap.scaled(
-                        120, 68, Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation))
-            except Exception:
-                pass
+            # Fetched on a worker thread: doing it inline blocked the whole UI
+            # for up to 5 s whenever the CDN was slow.
+            self._thumb_url = self._metadata["thumbnail"]
+            self._thumb_label = thumb
+            self._thumb_thread = threading.Thread(
+                target=self._fetch_thumbnail, args=(self._thumb_url,), daemon=True
+            )
+            self._thumb_thread.start()
         header.addWidget(thumb)
 
         info = QVBoxLayout()
@@ -215,6 +281,18 @@ class FormatSelectionDialog(QDialog):
         alay = QVBoxLayout(self._audio_tab)
         alay.setContentsMargins(0, 0, 0, 0)
         alay.addWidget(self._audio_list)
+        # Converting to MP3 means a lossy re-encode, so it is opt-in: the
+        # default keeps whatever the source provides (m4a/opus/webm).
+        self._mp3_check = QCheckBox("Convert to MP3 (re-encode)")
+        self._mp3_check.setToolTip(
+            "Off: keep the original audio stream (no quality loss).\n"
+            "On: convert to MP3 with ffmpeg."
+        )
+        self._mp3_check.toggled.connect(
+            lambda _checked: self._select_format(self._selected_id or "bestaudio/best",
+                                                 self._result_data.get("audio_only", False))
+        )
+        alay.addWidget(self._mp3_check)
         root.addWidget(self._tabs, 1)
 
         # Buttons
@@ -232,7 +310,12 @@ class FormatSelectionDialog(QDialog):
         root.addLayout(btn_row)
 
     def _populate_formats(self) -> None:
-        """Parse formats into video and audio tabs."""
+        """Parse formats into video and audio tabs.
+
+        Storyboards are skipped (they are image sheets, not videos) and an
+        audio-only source is opened on the Audio tab: a music URL used to open
+        on an empty Video tab, so the dialog looked broken.
+        """
         video_formats: list[FormatEntry] = []
         audio_formats: list[FormatEntry] = []
 
@@ -240,10 +323,13 @@ class FormatSelectionDialog(QDialog):
         for fmt in self._formats:
             entry = FormatEntry(fmt)
             self._entries[entry.format_id] = entry
+            if not entry.is_downloadable:
+                continue
             if entry.is_video:
-                if entry.height not in seen_heights:
-                    seen_heights.add(entry.height)
-                    video_formats.append(entry)
+                if entry.height > 0 and entry.height in seen_heights:
+                    continue
+                seen_heights.add(entry.height)
+                video_formats.append(entry)
             elif entry.audio_only:
                 audio_formats.append(entry)
 
@@ -260,6 +346,9 @@ class FormatSelectionDialog(QDialog):
             for entry in video_formats:
                 fmt_str = f"{entry.format_id}+bestaudio/best"
                 self._add_format_item(self._video_list, entry, format_id=fmt_str)
+        else:
+            self._tabs.setTabEnabled(0, False)
+            self._add_empty_state(self._video_list, "No video stream in this link.")
 
         # Populate audio tab
         if audio_formats:
@@ -272,6 +361,63 @@ class FormatSelectionDialog(QDialog):
                 self._add_format_item(self._audio_list, entry,
                                       format_id=f"{entry.format_id}/best",
                                       audio_only=True)
+        elif self._metadata_has_audio():
+            # Some player clients advertise no separate audio streams at all
+            # (tv/web_safari, mweb, tv_simply).  yt-dlp can still extract the
+            # audio, so offer that instead of an empty tab the user reads as
+            # "there is nothing".
+            placeholder = FormatEntry({
+                "format_id": "bestaudio", "ext": self._source_ext(),
+                "vcodec": "none", "acodec": "unknown",
+                "abr": self._best_abr(), "resolution": "audio only",
+            })
+            self._add_format_item(self._audio_list, placeholder, is_default=True,
+                                  format_id="bestaudio/best",
+                                  label_override="⚡ Best Audio (from this link)",
+                                  audio_only=True)
+            self._add_empty_state(
+                self._audio_list,
+                "This link lists no separate audio streams — the best audio "
+                "track will be extracted instead.",
+            )
+        else:
+            self._tabs.setTabEnabled(1, False)
+            self._add_empty_state(self._audio_list, "No audio stream in this link.")
+
+        # Open on a tab that has something in it: an audio-only link used to
+        # open on an empty "Video" tab, which reads as "there is nothing here".
+        if not video_formats and self._metadata_has_audio():
+            self._tabs.setCurrentIndex(1)
+
+    def _metadata_has_audio(self) -> bool:
+        """True when the source carries audio at all (may be muxed only)."""
+        if self._metadata.get("has_audio"):
+            return True
+        return any(_codec(f.get("acodec")) not in ("none", "")
+                   for f in self._formats)
+
+    def _best_abr(self) -> float:
+        return max((FormatEntry(f).abr for f in self._formats), default=0)
+
+    def _source_ext(self) -> str:
+        """Container to show in the synthetic row: the best muxed/audio ext."""
+        entries = [FormatEntry(f) for f in self._formats]
+        audio_exts = [e.ext for e in entries if e.audio_only and e.ext]
+        if audio_exts:
+            return audio_exts[0]
+        muxed = [e.ext for e in entries if e.is_video and e.ext]
+        return muxed[0] if muxed else ""
+
+    def _add_empty_state(self, lst: QListWidget, message: str) -> None:
+        """Show *message* inside an otherwise empty list."""
+        item = QListWidgetItem(lst)
+        label = QLabel(message)
+        label.setObjectName("muted")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        label.setWordWrap(True)
+        item.setSizeHint(label.sizeHint())
+        lst.addItem(item)
+        lst.setItemWidget(item, label)
 
     def _add_format_item(self, lst: QListWidget, entry: FormatEntry,
                          is_default: bool = False, format_id: str = "",
@@ -299,7 +445,7 @@ class FormatSelectionDialog(QDialog):
             "format": format_id,
             "audio_only": audio_only,
             "audio_format": "bestaudio",
-            "audio_format_ext": "mp3",
+            "audio_format_ext": "",
         }
         # Try to get quality label from the entry
         for entry in self._entries.values():
@@ -307,7 +453,21 @@ class FormatSelectionDialog(QDialog):
                 self._result_data["quality_label"] = f"{entry.height}p"
                 break
         if audio_only:
-            self._result_data["quality_label"] = "Audio"
+            # Honour the row the user actually clicked instead of always
+            # downloading "bestaudio" (picking 160 kbps used to silently give
+            # you whatever was best).
+            chosen = (format_id or "").split("/")[0].strip()
+            if chosen and chosen != "bestaudio":
+                self._result_data["audio_format"] = chosen
+            entry = self._entries.get(chosen)
+            if entry is not None:
+                self._result_data["audio_format_label"] = entry.label
+            self._result_data["audio_format_ext"] = (
+                "mp3" if self._mp3_check.isChecked() else ""
+            )
+            self._result_data["quality_label"] = (
+                "Audio · mp3" if self._mp3_check.isChecked() else "Audio · original"
+            )
         elif "quality_label" not in self._result_data:
             self._result_data["quality_label"] = "Best"
 

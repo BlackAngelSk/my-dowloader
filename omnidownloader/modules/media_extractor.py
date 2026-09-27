@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+from omnidownloader.core import platform_utils
 from omnidownloader.core.base_module import BaseDownloaderModule
 from omnidownloader.core.models import DownloadJob, DownloadState
-from omnidownloader.core.disk_utils import ensure_directory
+from omnidownloader.core.disk_utils import ensure_directory, verify_checksum
 from omnidownloader.services.dependency_manager import DependencyManager
 
 logger = logging.getLogger(__name__)
@@ -47,7 +48,12 @@ MEDIA_DOMAINS = {
 # is available.  ``bv*`` (bestvideo*) is more robust than the older
 # ``bestvideo`` against YouTube's ever-changing format-ID schemes.
 BEST_VIDEO_AUDIO = "bv*+ba/b"
-BEST_AUDIO_ONLY = "bestaudio/best"
+#: ``ba/b`` rather than ``bestaudio/best``: clients that advertise no
+#: audio-only streams (tv/web_safari, mweb, tv_simply, android…) fail with
+#: "Requested format is not available" for ``bestaudio``, while ``ba/b`` falls
+#: back to a muxed stream and ``-x`` extracts its audio.  Verified by running
+#: both selectors against every client in the matrix below.
+BEST_AUDIO_ONLY = "ba/b"
 
 # ── YouTube-specific client configuration ──────────────────────
 # YouTube gates its high-res adaptive streams behind a "player client".
@@ -66,9 +72,18 @@ YOUTUBE_DOMAINS = {"youtube.com", "youtu.be", "m.youtube.com"}
 _YOUTUBE_CLIENT_CANDIDATES: tuple[str, ...] = (
     "web_embedded",
     "tv,web_safari",
+    "web_safari",
+    "web",
+    "android",
     "mweb",
     "tv_simply",
 )
+
+#: Clients deliberately NOT in the list above, and why (measured, audio+video):
+#:   android_vr  — advertises 2160p but every stream 403s on download
+#:   tv          — "The page needs to be reloaded"
+#:   ios         — "Requested format is not available"
+#: Re-check with the matrix in tools/test_audio_only.py before adding any back.
 
 # stderr fragments from yt-dlp that mean "this player client is being
 # rejected — try the next one" rather than "this URL is undownloadable".
@@ -76,6 +91,11 @@ _RETRYABLE_YTDLP_MARKERS: tuple[str, ...] = (
     "403",
     "forbidden",
     "page needs to be reloaded",
+    # YouTube intermittently returns formats without URLs (SABR-only) for a
+    # client that worked moments ago: the same request usually succeeds.
+    "sabr",
+    "missing a url",
+    "some web_embedded client",
     "requested format is not available",
     "sign in to confirm",
     "unable to extract",
@@ -142,6 +162,8 @@ class MediaExtractor(BaseDownloaderModule):
         self._proxy_manager = proxy_manager
         # Last YouTube player_client that actually worked — tried first next time
         self._yt_client: str | None = None
+        # Live yt-dlp processes, so pause/resume/cancel can act on them
+        self._procs: dict[str, asyncio.subprocess.Process] = {}
 
     async def _ensure_ytdlp_available(self) -> str:
         """Ensure yt-dlp exists at ``self._ytdlp``, downloading it if necessary.
@@ -172,10 +194,10 @@ class MediaExtractor(BaseDownloaderModule):
 
     @staticmethod
     def _is_youtube_url(url: str) -> bool:
-        """Return *True* when *url* points to a YouTube domain."""
+        """Return *True* when *url* points to a YouTube domain (incl. subdomains)."""
         try:
             host = (urlparse(url).hostname or "").removeprefix("www.")
-            return host in YOUTUBE_DOMAINS
+            return MediaExtractor._host_matches(host, YOUTUBE_DOMAINS)
         except Exception:
             return False
 
@@ -223,27 +245,40 @@ class MediaExtractor(BaseDownloaderModule):
 
     # ── URL routing ─────────────────────────────────────────────
 
-    def can_handle(self, url):
-        """Accept any HTTP/HTTPS URL — yt-dlp supports thousands of sites.
+    #: Schemes only yt-dlp understands (never a plain HTTP fetch).
+    STREAMING_SCHEMES = ("rtmp", "rtmpe", "rtmps", "rtsp", "mms", "m3u8")
 
-        Excludes direct image file URLs so ImageScraper can handle those,
-        and the ``scrape:`` prefix which is an ImageScraper convention.
+    @staticmethod
+    def _host_matches(host: str, domains: set[str]) -> bool:
+        """True when *host* is a domain in *domains* or a subdomain of one."""
+        if not host:
+            return False
+        host = host.removeprefix("www.")
+        return any(host == d or host.endswith("." + d) for d in domains)
+
+    def can_handle(self, url):
+        """Claim URLs this module is actually the right tool for.
+
+        Deliberately NOT a catch-all for http(s): the download manager routes
+        unknown-but-yt-dlp-supported URLs here itself (see
+        ``DownloadManager._dispatch_job``), so claiming every URL would just
+        starve the multi-connection HTTPDownloader — every direct file
+        download would go through yt-dlp instead of the segmented engine.
         """
         try:
             if url.startswith("scrape:"):
                 return False  # let ImageScraper handle it
-            scheme = urlparse(url).scheme.lower()
+            parsed = urlparse(url)
+            scheme = parsed.scheme.lower()
+            if scheme in self.STREAMING_SCHEMES:
+                return True
             if scheme in ("http", "https"):
-                # Exclude direct image file links (ImageScraper territory)
-                path = urlparse(url).path.lower()
+                path = parsed.path.lower()
                 _IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
                               ".svg", ".tiff", ".avif")
                 if any(path.endswith(e) for e in _IMAGE_EXT):
-                    return False
-                return True
-            # Also accept other schemes yt-dlp understands (rtmp, rtsp, etc.)
-            if scheme in ("rtmp", "rtmpe", "rtmps", "rtsp", "mms", "m3u8"):
-                return True
+                    return False  # ImageScraper territory
+                return self._host_matches(parsed.hostname or "", MEDIA_DOMAINS)
             return False
         except Exception:
             return False
@@ -272,7 +307,7 @@ class MediaExtractor(BaseDownloaderModule):
             MediaExtractor._append_youtube_args(cmd, url)
             cmd.append(url)
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *cmd, **platform_utils.subprocess_kwargs(),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
@@ -281,36 +316,200 @@ class MediaExtractor(BaseDownloaderModule):
         except (asyncio.TimeoutError, OSError):
             return False
 
-    async def extract_metadata(self, url):
+    async def _dump_json(self, url: str, single: bool = False,
+                         client: Optional[str] = None) -> dict:
+        """Run yt-dlp and return parsed JSON for *url*.
+
+        ``single=True`` uses ``--dump-single-json --flat-playlist``, which
+        emits exactly one document for playlists too — a plain ``--dump-json``
+        on a playlist prints one JSON object per entry, and parsing that as a
+        single document failed with "Extra data: line 2 column 1".
+
+        ``client`` forces one specific player client (used by the degraded
+        ladder retry); otherwise the cached/ordered candidates are tried.
+        """
         await self._ensure_ytdlp_available()
-        candidates = self._client_candidates(url, self._yt_client)
+        candidates = (client,) if client else self._client_candidates(url, self._yt_client)
         stdout = b""
         last_err = ""
-        for idx, client in enumerate(candidates):
-            cmd = [self._ytdlp, "--dump-json", "--no-download",
-                   "--no-warnings", "--no-check-certificates"]
-            self._append_youtube_args(cmd, url, client)
+        for idx, cand in enumerate(candidates):
+            cmd = [self._ytdlp, "--no-download", "--no-warnings",
+                   "--no-check-certificates"]
+            cmd += (["--dump-single-json", "--flat-playlist"] if single
+                    else ["--dump-json"])
+            self._append_youtube_args(cmd, url, cand)
             if self._proxy_manager and self._proxy_manager.enabled:
                 cmd += self._proxy_manager.get_ytdlp_args()
             cmd.append(url)
             proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                *cmd, **platform_utils.subprocess_kwargs(),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await proc.communicate()
             if proc.returncode == 0:
-                if client:
-                    self._yt_client = client
+                if cand:
+                    self._yt_client = cand
                 break
             last_err = stderr.decode(errors="replace")[:500]
-            if client is None or idx == len(candidates) - 1 or not self._is_retryable_failure(last_err):
+            if cand is None or idx == len(candidates) - 1 or not self._is_retryable_failure(last_err):
                 raise RuntimeError(f"yt-dlp failed: {last_err}")
             logger.warning(
                 "yt-dlp metadata failed with player_client=%s (%s) — retrying with the next client",
-                client, last_err.strip().splitlines()[0][:160] if last_err.strip() else "unknown error",
+                cand, last_err.strip().splitlines()[0][:160] if last_err.strip() else "unknown error",
             )
         try:
-            info = json.loads(stdout.decode(errors="replace"))
+            return json.loads(stdout.decode(errors="replace"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise RuntimeError(f"yt-dlp returned unreadable JSON: {exc}") from exc
+
+    async def extract_metadata(self, url):
+        info = await self._dump_json(url, single=True)
+        if info.get("_type") == "playlist" or "entries" in info:
+            return await self._playlist_metadata(info)
+        meta = self._video_metadata(info)
+        if self._is_youtube_url(url) and self._looks_degraded(meta):
+            # YouTube intermittently answers with a reduced format set (a few
+            # 360p formats and storyboards only) for the client that just
+            # succeeded.  Ask the other clients before settling for that.
+            meta = await self._retry_for_better_ladder(url, meta)
+        if self._is_youtube_url(url) and self._has_audio(meta) and not self._audio_choices(meta):
+            # Some player clients (tv/web_safari, mweb, tv_simply) expose no
+            # separate audio streams at all — and the working client is cached,
+            # so an earlier fallback would silently leave the Audio tab empty
+            # for the rest of the session ("I can't download only audio").
+            meta = await self._retry_for_audio_choices(url, meta)
+        return meta
+
+    @staticmethod
+    def _audio_choices(meta: dict) -> list[dict]:
+        """Formats that are audio-only (no video stream, but real audio)."""
+        return [
+            f for f in meta.get("formats", [])
+            if (f.get("vcodec") in ("none", "", None)
+                and f.get("acodec") not in ("none", "", None))
+        ]
+
+    @staticmethod
+    def _has_audio(meta: dict) -> bool:
+        return any(f.get("acodec") not in ("none", "", None)
+                   for f in meta.get("formats", []))
+
+    async def _retry_for_audio_choices(self, url: str, best_meta: dict) -> dict:
+        """Find a player client that offers separate audio streams.
+
+        ``web_embedded`` is tried first, because it is the client that
+        advertises the per-bitrate audio ladder on YouTube.
+        """
+        candidates = self._client_candidates(url, "web_embedded")
+        for client in candidates:
+            if client == self._yt_client and self._audio_choices(best_meta):
+                continue
+            if client == self._yt_client:
+                continue
+            try:
+                candidate = self._video_metadata(await self._dump_json(url, client=client))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Audio-choice retry with player_client=%s failed: %s", client, exc)
+                continue
+            if self._audio_choices(candidate):
+                logger.info(
+                    "player_client=%s offers no audio streams — switching to %s for audio choices",
+                    self._yt_client, client,
+                )
+                self._yt_client = client
+                return candidate
+        # No client helped: keep what we have.  The dialog still offers a
+        # synthetic "best audio" option, so audio downloads remain possible.
+        logger.debug("No player client offered separate audio streams for %s", url)
+        return best_meta
+
+    @staticmethod
+    def _looks_degraded(meta: dict) -> bool:
+        """True when the format list is suspiciously poor for a video."""
+        video_formats = [
+            f for f in meta.get("formats", [])
+            if f.get("vcodec") not in ("none", "")
+        ]
+        return len(video_formats) <= 6 and meta.get("max_height", 0) <= 360
+
+    async def _retry_for_better_ladder(self, url: str, best_meta: dict) -> dict:
+        """Try the remaining player clients and keep the richest format list."""
+        for client in self._client_candidates(url, None):
+            if client == self._yt_client:
+                continue
+            try:
+                candidate = self._video_metadata(
+                    await self._dump_json(url, client=client)
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Ladder retry with player_client=%s failed: %s", client, exc)
+                continue
+            if candidate.get("max_height", 0) > best_meta.get("max_height", 0):
+                logger.info(
+                    "Reduced format ladder (%sp) — player_client=%s offers %sp",
+                    best_meta.get("max_height", 0), client,
+                    candidate.get("max_height", 0),
+                )
+                self._yt_client = client
+                best_meta = candidate
+                if not self._looks_degraded(candidate):
+                    break
+        return best_meta
+
+    async def _playlist_metadata(self, info: dict) -> dict:
+        """Describe a playlist: its entries plus the first entry's formats.
+
+        The format list comes from the first entry so the quality dialog still
+        means something; the chosen quality is then applied to every entry.
+        """
+        items: list[dict] = []
+        for entry in (info.get("entries") or []):
+            if not entry:
+                continue
+            entry_url = entry.get("url") or entry.get("webpage_url")
+            if not entry_url and entry.get("id"):
+                entry_url = f"https://www.youtube.com/watch?v={entry['id']}"
+            if not entry_url or not str(entry_url).startswith("http"):
+                continue
+            items.append({
+                "url": entry_url,
+                "title": entry.get("title") or "",
+                "duration": entry.get("duration") or 0,
+            })
+
+        video_meta: dict = {}
+        if items:
+            try:
+                video_meta = self._video_metadata(
+                    await self._dump_json(items[0]["url"])
+                )
+            except Exception as exc:  # noqa: BLE001 - playlist still usable
+                logger.debug("Could not read formats from the first entry: %s", exc)
+
+        formats = video_meta.get("formats", [])
+        return {
+            "title": info.get("title") or "Playlist",
+            "thumbnail": info.get("thumbnail") or "",
+            "uploader": info.get("uploader") or info.get("channel") or "",
+            "duration": 0,
+            "is_playlist": True,
+            "playlist_count": len(items),
+            "entries": items,
+            "formats": formats,
+            "subtitles": video_meta.get("subtitles", []),
+            "filesize_best": -1,
+            "has_video": bool(video_meta.get("has_video")),
+            "has_audio": bool(video_meta.get("has_audio")),
+            "max_height": video_meta.get("max_height", 0),
+        }
+
+    @staticmethod
+    def _video_metadata(info: dict) -> dict:
+        def _codec(value) -> str:
+            """Normalise a codec field: extractors send ``"none"`` or ``null``."""
+            if value is None:
+                return "none"
+            return str(value).strip() or "none"
+
         formats = []
         for f in info.get("formats", []):
             formats.append({
@@ -318,8 +517,8 @@ class MediaExtractor(BaseDownloaderModule):
                 "ext": f.get("ext", ""),
                 "resolution": f.get("resolution", "audio only"),
                 "filesize": f.get("filesize") or f.get("filesize_approx", 0),
-                "vcodec": f.get("vcodec", "none"),
-                "acodec": f.get("acodec", "none"),
+                "vcodec": _codec(f.get("vcodec")),
+                "acodec": _codec(f.get("acodec")),
                 "fps": f.get("fps") or 0,
                 "abr": f.get("abr") or 0,
                 "height": f.get("height") or 0,
@@ -335,9 +534,9 @@ class MediaExtractor(BaseDownloaderModule):
                 "formats": formats,
                 "subtitles": list(info.get("subtitles", {}).keys()),
                 "filesize_best": info.get("filesize") or info.get("filesize_approx", -1),
-                "has_video": any(f.get("vcodec", "none") != "none" for f in info.get("formats", [])),
-                "has_audio": any(f.get("acodec", "none") != "none" for f in info.get("formats", [])),
-                "max_height": max((f.get("height") or 0 for f in info.get("formats", [])), default=0),}
+                "has_video": any(f["vcodec"] != "none" for f in formats),
+                "has_audio": any(f["acodec"] != "none" for f in formats),
+                "max_height": max((f["height"] for f in formats), default=0)}
 
     async def start_download(self, job, progress_callback=None):
         job.state = DownloadState.DOWNLOADING
@@ -353,8 +552,10 @@ class MediaExtractor(BaseDownloaderModule):
 
         # Resolve ffmpeg path and check availability for merge-heavy downloads
         ffmpeg_dir = self._resolve_ffmpeg_dir()
-        needs_merge = not job.metadata.get("audio_only", False)
-        if needs_merge and not ffmpeg_dir:
+        audio_only = bool(job.metadata.get("audio_only", False))
+        # Audio *extraction* (-x) needs ffmpeg too, not just video merging.
+        needs_ffmpeg = not audio_only or bool(job.metadata.get("audio_format_ext"))
+        if needs_ffmpeg and not ffmpeg_dir:
             logger.warning("ffmpeg not found — high-res video+audio merge may fail")
 
         # Get the user's chosen format, or use universal best
@@ -368,40 +569,65 @@ class MediaExtractor(BaseDownloaderModule):
         # Try the player client that last worked (or the first candidate),
         # then fall back down the list when YouTube rejects this one.
         candidates = self._client_candidates(job.url, self._yt_client)
-        last_err = ""
+        errors: list[tuple[str, str]] = []
+        success = False
         for idx, client in enumerate(candidates):
-            # The user's format_id was read with a *different* player client on
-            # a fallback attempt, so it may not exist there — use the universal
-            # best-quality selector instead of failing outright.
-            attempt_fmt = fmt if idx == 0 else BEST_VIDEO_AUDIO
-            cmd = self._build_download_cmd(job, client, attempt_fmt, ffmpeg_dir, output_tpl)
-            returncode, stderr_out = await self._stream_download(cmd, job, progress_callback)
+            # One extra try on the *same* client: YouTube's "SABR-only" /
+            # "formats missing a URL" answer is intermittent — the identical
+            # request usually succeeds a second later.
+            for attempt in range(2):
+                # The user's format_id was read with a *different* player client
+                # on a fallback attempt, so it may not exist there — widen to
+                # the universal selector instead of failing outright.  For an
+                # audio-only job that selector must stay audio-only, or the
+                # retry quietly downloads the whole video.
+                if idx == 0 and attempt == 0 and fmt:
+                    attempt_fmt = fmt
+                elif job.metadata.get("audio_only", False):
+                    attempt_fmt = BEST_AUDIO_ONLY
+                else:
+                    attempt_fmt = BEST_VIDEO_AUDIO
+                cmd = self._build_download_cmd(job, client, attempt_fmt, ffmpeg_dir, output_tpl)
+                returncode, stderr_out = await self._stream_download(cmd, job, progress_callback)
+                if returncode == 0:
+                    success = True
+                    break
 
-            if returncode == 0:
+                last_err = stderr_out[:500]
+                errors.append((client or "(default)", last_err))
+                if not self._is_retryable_failure(last_err):
+                    break
+                logger.warning(
+                    "yt-dlp download failed with player_client=%s (%s) — %s",
+                    client,
+                    last_err.strip().splitlines()[0][:160] if last_err.strip() else "unknown error",
+                    "retrying the same client" if attempt == 0 else "trying the next client",
+                )
+                self._cleanup_partial_downloads(output_dir)
+            if success:
                 if client:
                     self._yt_client = client
                 last_err = ""
                 break
-
-            last_err = stderr_out[:500]
-            if (
-                client is None
-                or idx == len(candidates) - 1
-                or not self._is_retryable_failure(last_err)
-            ):
-                self._cancel_events.pop(job.id, None)
-                raise RuntimeError(f"yt-dlp failed: {last_err}")
-
-            logger.warning(
-                "yt-dlp download failed with player_client=%s (%s) — retrying with the next client",
-                client,
-                last_err.strip().splitlines()[0][:160] if last_err.strip() else "unknown error",
-            )
-            self._cleanup_partial_downloads(output_dir)
+            if client is None:
+                break
 
         self._cancel_events.pop(job.id, None)
-        if last_err:
-            raise RuntimeError(f"yt-dlp failed: {last_err}")
+        if not success:
+            # Report the *first* failure: the last one is usually a downstream
+            # client that was never viable (a PO-token warning tells the user
+            # nothing), while the first attempt is the one that nearly worked.
+            first_client, first_err = errors[0] if errors else ("(default)", "unknown error")
+            if len(errors) > 1:
+                logger.error(
+                    "All %d player clients failed for %s; first error (%s): %s",
+                    len(errors), job.url, first_client, first_err[:300],
+                )
+            raise RuntimeError(
+                f"yt-dlp failed: {first_err}"
+                + (f" (also tried {len(errors) - 1} more player clients)"
+                   if len(errors) > 1 else "")
+            )
 
         # Point the job at the file this run actually produced
         produced = self._find_downloaded_file(output_dir, before)
@@ -410,15 +636,33 @@ class MediaExtractor(BaseDownloaderModule):
         else:
             logger.warning("yt-dlp reported success but no new file appeared in %s", output_dir)
 
+        expected = job.metadata.get("expected_checksum")
+        if expected and job.file_path:
+            ok, detail = verify_checksum(job.file_path, expected)
+            if not ok:
+                logger.error("Checksum verification failed for %s: %s", job.file_path, detail)
+                job.state = DownloadState.FAILED
+                job.error_message = f"Checksum verification failed — {detail}"
+                return
+            job.metadata["checksum_verified"] = detail
+            logger.info("Checksum verified for %s (%s)", job.file_path, detail)
+
     def _build_download_cmd(self, job, client: str | None, fmt: str,
                             ffmpeg_dir: str, output_tpl: str) -> list[str]:
         """Assemble the yt-dlp argv for one download attempt."""
         if job.metadata.get("audio_only", False):
-            audio_fmt = job.metadata.get("audio_format", BEST_AUDIO_ONLY)
-            audio_ext = job.metadata.get("audio_format_ext", "mp3")
-            cmd = [self._ytdlp, "-f", audio_fmt,
-                   "-x", "--audio-format", audio_ext,
-                   "--newline", "-o", output_tpl]
+            # The selector comes from the caller so a retry can widen it: the
+            # dialog's per-row choice ("140/best") does not exist on every
+            # player client, and ignoring this argument made every fallback
+            # attempt re-request the same missing format.
+            audio_fmt = (fmt or job.metadata.get("audio_format")
+                         or BEST_AUDIO_ONLY)
+            audio_ext = job.metadata.get("audio_format_ext", "")
+            cmd = [self._ytdlp, "-f", audio_fmt, "-x", "--newline", "-o", output_tpl]
+            if audio_ext:
+                # Only re-encode when the user asked for it: converting to mp3
+                # by default threw away quality the source already had.
+                cmd += ["--audio-format", audio_ext]
         else:
             cmd = [self._ytdlp, "-f", fmt,
                    "--merge-output-format", "mp4",
@@ -443,7 +687,8 @@ class MediaExtractor(BaseDownloaderModule):
         Returns ``(returncode, stderr_text)``.
         """
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            *cmd, **platform_utils.subprocess_kwargs(),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
         # Drain stderr concurrently: an undrained pipe fills its ~64 KiB buffer
         # and deadlocks the child until we call proc.wait() forever.
@@ -453,11 +698,15 @@ class MediaExtractor(BaseDownloaderModule):
             return await stream.read()
 
         stderr_task = asyncio.create_task(_drain(proc.stderr))
+        # Publish the process so pause/resume can signal it.
+        self._procs[job.id] = proc
         try:
             if proc.stdout:
                 async for line in proc.stdout:
                     if self._cancel_events.get(job.id, asyncio.Event()).is_set():
-                        proc.terminate()
+                        # yt-dlp spawns ffmpeg for the merge: kill the tree,
+                        # not just the parent, or ffmpeg keeps writing.
+                        platform_utils.kill_process_tree(proc)
                         await proc.wait()
                         raise asyncio.CancelledError()
                     text = line.decode(errors="replace").strip()
@@ -467,6 +716,9 @@ class MediaExtractor(BaseDownloaderModule):
         except BaseException:
             stderr_task.cancel()
             raise
+        finally:
+            if self._procs.get(job.id) is proc:
+                self._procs.pop(job.id, None)
         return returncode, stderr_out
 
     @staticmethod
@@ -536,4 +788,42 @@ class MediaExtractor(BaseDownloaderModule):
         e = self._cancel_events.get(job.id)
         if e:
             e.set()
+
+    # ── pause / resume ──────────────────────────────────────────
+
+    async def pause(self, job) -> None:
+        """Suspend the running yt-dlp process for *job*.
+
+        Without this the base class' no-op made the UI claim PAUSED while the
+        download kept running — the file just kept growing.
+        """
+        proc = self._procs.get(job.id)
+        if proc is None or proc.returncode is not None:
+            logger.warning("pause: no active yt-dlp process for job %s", job.id)
+            return
+        if self._suspend_process(proc.pid):
+            logger.info("Paused yt-dlp (pid %s) for job %s", proc.pid, job.id)
+        else:
+            logger.warning("pause: could not suspend yt-dlp (pid %s)", proc.pid)
+
+    async def resume(self, job) -> None:
+        """Resume a suspended yt-dlp process for *job*."""
+        proc = self._procs.get(job.id)
+        if proc is None or proc.returncode is not None:
+            logger.warning("resume: no active yt-dlp process for job %s", job.id)
+            return
+        if self._resume_process(proc.pid):
+            logger.info("Resumed yt-dlp (pid %s) for job %s", proc.pid, job.id)
+        else:
+            logger.warning("resume: could not resume yt-dlp (pid %s)", proc.pid)
+
+    @staticmethod
+    def _suspend_process(pid: int) -> bool:
+        """Freeze a process (SIGSTOP, or NtSuspendProcess on Windows)."""
+        return platform_utils.suspend_process(pid)
+
+    @staticmethod
+    def _resume_process(pid: int) -> bool:
+        """Thaw a process frozen by :meth:`_suspend_process`."""
+        return platform_utils.resume_process(pid)
 

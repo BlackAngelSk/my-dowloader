@@ -21,11 +21,22 @@ from packaging.version import Version
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
+from omnidownloader.core import platform_utils
+
 logger = logging.getLogger(__name__)
 
 _GITHUB_API = "https://api.github.com/repos/BlackAngelSk/my-dowloader"
 _RELEASES_URL = f"{_GITHUB_API}/releases/latest"
 _REPO_URL = "https://github.com/BlackAngelSk/my-dowloader"
+
+#: Release assets are named per platform, but the naming is easy to get wrong
+#: (a "linux" build on Windows would be downloaded and fail to run), so the
+#: platform is also confirmed from the file name.
+_ASSET_PLATFORM_HINTS = {
+    platform_utils.WINDOWS: lambda n: "macos" not in n.lower() and "linux" not in n.lower(),
+    platform_utils.MACOS: lambda n: "macos" in n.lower() or "darwin" in n.lower(),
+    platform_utils.LINUX: lambda n: "linux" in n.lower() or "appimage" in n.lower(),
+}
 
 
 @dataclass
@@ -42,7 +53,32 @@ class UpdateInfo:
         return Version(self.version)
 
     @property
+    def platform_asset(self) -> Optional[dict]:
+        """The release asset built for *this* platform.
+
+        The release carries one artifact per OS, so picking "the first .zip"
+        (or a Windows installer on Linux) would hand the user a file their
+        machine cannot run.
+        """
+        wanted = {
+            platform_utils.WINDOWS: (".exe", ".msi", ".zip"),
+            platform_utils.MACOS: (".dmg", ".pkg", ".zip"),
+            platform_utils.LINUX: (".appimage", ".tar.gz", ".zip"),
+        }.get(platform_utils.system(), (".zip",))
+
+        assets = [a for a in self.assets if a.get("name")]
+        for suffix in wanted:
+            for asset in assets:
+                name = asset["name"]
+                if name.lower().endswith(suffix) and _ASSET_PLATFORM_HINTS.get(
+                    platform_utils.system(), lambda _n: True
+                )(name):
+                    return asset
+        return None
+
+    @property
     def installer_asset(self) -> Optional[dict]:
+        """Windows-style installer, when the release ships one."""
         for a in self.assets:
             name = a.get("name", "")
             if name.endswith(".exe") and "Setup" in name:
@@ -59,10 +95,9 @@ class UpdateInfo:
 
     @property
     def download_url(self) -> str:
-        if sys.platform == "win32" and self.installer_asset:
-            return self.installer_asset["browser_download_url"]
-        if self.zip_asset:
-            return self.zip_asset["browser_download_url"]
+        asset = self.platform_asset or self.installer_asset or self.zip_asset
+        if asset:
+            return asset["browser_download_url"]
         return f"{_REPO_URL}/archive/refs/tags/{self.tag}.zip"
 
 
@@ -111,7 +146,7 @@ class UpdateChecker(QThread):
                 data = await resp.json()
 
         tag = data.get("tag_name", "")
-        version_str = tag.lstrip("v")
+        version_str = tag[1:] if tag.startswith("v") else tag
         try:
             remote = Version(version_str)
             local = Version(self._current)
@@ -168,9 +203,13 @@ class UpdateDownloader(QThread):
                 dest = Path(self._dest_dir)
                 cd = resp.headers.get("Content-Disposition", "")
                 if "filename=" in cd:
-                    fname = cd.split("filename=")[-1].strip('" ')
+                    # Sanitise: a server-supplied "../../evil" filename used to
+                    # be joined onto the destination directory verbatim.
+                    fname = Path(cd.split("filename=")[-1].strip('" ')).name
                 else:
-                    fname = self._url.split("/")[-1].split("?")[0]
+                    fname = Path(self._url.split("/")[-1].split("?")[0]).name
+                if not fname:
+                    fname = "update.bin"
                 filepath = dest / fname
                 downloaded = 0
                 with open(filepath, "wb") as f:
@@ -229,48 +268,142 @@ class UpdateService(QObject):
 
     @staticmethod
     def install_update(file_path: str) -> bool:
+        """Install a downloaded update, quitting the app first if needed.
+
+        Per platform:
+
+        * Windows: run the Inno Setup installer.  It cannot overwrite
+          OmniDownloader.exe while it is running, and ``/NORESTART`` means it
+          will not retry after a reboot, so the app must exit *before* the
+          installer starts.
+        * macOS: mount the .dmg and reveal it — replacing a running .app
+          bundle from inside the app is not something the OS supports.
+        * Linux: chmod +x and run an AppImage in place, or unpack a tarball/
+          zip next to the app.  Never over site-packages.
+        """
         path = Path(file_path)
-        if sys.platform == "win32" and path.suffix == ".exe":
+
+        if platform_utils.is_windows() and path.suffix.lower() in (".exe", ".msi"):
             try:
-                subprocess.Popen([str(path), "/SILENT", "/NORESTART"], shell=False)
-                return True
-            except Exception as exc:
+                subprocess.Popen([str(path), "/SILENT", "/NORESTART"], shell=False,
+                                 **platform_utils.subprocess_kwargs())
+            except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to launch installer: %s", exc)
                 return False
-        if path.suffix == ".zip":
-            import zipfile
+            UpdateService._quit_app()
+            return True
+
+        if path.suffix.lower() == ".dmg":  # pragma: no cover - macOS only
+            platform_utils.open_path(path)
+            logger.info("Mounted %s — drag OmniDownloader.app to Applications", path.name)
+            UpdateService._quit_app()
+            return True
+
+        if path.suffix.lower() == ".appimage":  # pragma: no cover - Linux only
+            target = Path(sys.executable) if getattr(sys, "frozen", False) else path
             try:
-                app_dir = Path(sys.executable).parent if getattr(sys, 'frozen', False) \
-                    else Path(__file__).parent.parent.parent
-                with zipfile.ZipFile(path, 'r') as zf:
-                    names = zf.namelist()
-                    prefix = ""
-                    if names:
-                        top = names[0].split("/")[0]
-                        if all(n.startswith(top + "/") for n in names if "/" in n):
-                            prefix = top + "/"
-                    for name in names:
-                        if not name.startswith(prefix):
-                            continue
-                        target = app_dir / name[len(prefix):]
-                        if name.endswith("/"):
-                            target.mkdir(parents=True, exist_ok=True)
-                        else:
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            with zf.open(name) as src, open(target, "wb") as dst:
-                                shutil.copyfileobj(src, dst)
+                if getattr(sys, "frozen", False):
+                    shutil.copy2(path, target)
+                platform_utils.make_executable(target)
+            except OSError as exc:
+                logger.error("Failed to install AppImage: %s", exc)
+                return False
+            logger.info("AppImage updated at %s — restarting", target)
+            UpdateService._quit_app()
+            return True
+
+        if path.suffix.lower() in (".zip", ".tar.gz", ".tgz"):
+            try:
+                app_dir = UpdateService._install_root()
+                if app_dir is None:
+                    return False
+                UpdateService._unpack_archive(path, app_dir)
                 return True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to extract update: %s", exc)
                 return False
         logger.warning("Unsupported update file type: %s", path.suffix)
         return False
 
     @staticmethod
-    def restart_app() -> None:
-        if sys.platform == "win32":
-            exe = sys.executable
-            subprocess.Popen([exe, "-m", "omnidownloader"])
+    def _install_root() -> Optional[Path]:
+        """Where an unpacked update may be written, or None if unsafe."""
+        app_dir = (Path(sys.executable).parent if getattr(sys, "frozen", False)
+                   else Path(__file__).parent.parent.parent)
+        if "site-packages" in str(app_dir):
+            logger.error("Refusing to unpack an update over site-packages (%s)", app_dir)
+            return None
+        return app_dir
+
+    @staticmethod
+    def _unpack_archive(path: Path, app_dir: Path) -> None:
+        """Extract a release archive into *app_dir*, flattening the top folder."""
+        import tarfile
+        import zipfile
+
+        if path.suffix.lower() == ".zip":
+            with zipfile.ZipFile(path) as zf:
+                names = zf.namelist()
+                prefix = ""
+                if names:
+                    top = names[0].split("/")[0]
+                    if all(n.startswith(top + "/") for n in names if "/" in n):
+                        prefix = top + "/"
+                for name in names:
+                    if not name.startswith(prefix):
+                        continue
+                    target = app_dir / name[len(prefix):]
+                    if name.endswith("/"):
+                        target.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with zf.open(name) as src, open(target, "wb") as dst:
+                            shutil.copyfileobj(src, dst)
         else:
-            os.execv(sys.executable, [sys.executable, "-m", "omnidownloader"])
+            with tarfile.open(path, "r:*") as tf:
+                members = tf.getmembers()
+                prefix = ""
+                if members:
+                    top = members[0].name.split("/")[0]
+                    if all(m.name.startswith(top + "/") for m in members if "/" in m.name):
+                        prefix = top + "/"
+                for member in members:
+                    if not member.isfile() or not member.name.startswith(prefix):
+                        continue
+                    target = app_dir / member.name[len(prefix):]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    extracted = tf.extractfile(member)
+                    if extracted is None:
+                        continue
+                    with extracted, open(target, "wb") as dst:
+                        shutil.copyfileobj(extracted, dst)
+
+    @staticmethod
+    def _quit_app() -> None:
+        """Quit the Qt application if one is running (no-op otherwise)."""
+        try:
+            from PyQt6.QtWidgets import QApplication
+            inst = QApplication.instance()
+            if inst is not None:
+                inst.quit()
+        except ImportError:
+            pass
+
+    @staticmethod
+    def restart_app() -> None:
+        """Relaunch the application and exit the current process."""
+        args = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            # Only a source checkout needs "-m omnidownloader"; the frozen
+            # bootloader does not implement -m, so passing it just started a
+            # second copy of the app while the old one kept running.
+            args += ["-m", "omnidownloader"]
+        try:
+            # Detached from this process: on Windows the new copy must not be
+            # in the same job object as the exiting one.
+            subprocess.Popen(args, cwd=None, **platform_utils.subprocess_kwargs())
+        except OSError as exc:
+            logger.error("Failed to relaunch: %s", exc)
+            return
+        UpdateService._quit_app()
 

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 import os
-import platform
 import shutil
 from pathlib import Path
 
@@ -25,9 +24,12 @@ def ensure_directory(path: str | Path) -> Path:
 def preallocate_file(path: str | Path, size: int) -> int:
     """Pre-allocate *size* bytes on disk at *path*.
 
-    - Linux:   uses ``fallocate`` via ``os.posix_fallocate``
-    - Windows: uses ``SetFileValidData`` via ctypes
-    - Fallback: writes zeros (slower but universal)
+    Pre-allocation keeps the file from fragmenting and lets segmented
+    downloads seek freely inside it.
+
+    - Linux:   ``os.posix_fallocate`` (real allocation, no zeroing cost)
+    - Anywhere with ftruncate: extend the file sparsely (works on Windows)
+    - Last resort: write zeros (slow but universal)
 
     Returns the file descriptor (caller must close).
     """
@@ -37,52 +39,27 @@ def preallocate_file(path: str | Path, size: int) -> int:
     ensure_directory(path)
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o644)
 
-    system = platform.system()
     try:
-        if system == "Linux":
-            _fallocate_linux(fd, size)
-        elif system == "Windows":
-            _fallocate_windows(fd, size)
+        if hasattr(os, "posix_fallocate"):
+            os.posix_fallocate(fd, 0, size)
         else:
-            _fallocate_fallback(fd, size)
-        logger.info("Pre-allocated %s (%s) for %s", _fmt_size(size), system, path)
+            os.ftruncate(fd, size)
+        os.lseek(fd, 0, os.SEEK_SET)
+        logger.info(
+            "Pre-allocated %s for %s", _fmt_size(size), path,
+        )
     except OSError as exc:
-        logger.warning("Pre-allocation failed, falling back to zeroing: %s", exc)
-        _fallocate_fallback(fd, size)
+        # posix_fallocate fails on filesystems without support (some
+        # network/NTFS mounts) — fall back to extent extension, then zeros.
+        logger.warning("Fast pre-allocation failed (%s), trying ftruncate", exc)
+        try:
+            os.ftruncate(fd, size)
+            os.lseek(fd, 0, os.SEEK_SET)
+        except OSError as exc2:
+            logger.warning("ftruncate failed too (%s), zero-filling", exc2)
+            _fallocate_fallback(fd, size)
 
     return fd
-
-
-def _fallocate_linux(fd: int, size: int) -> None:
-    """Use os.posix_fallocate (available on Linux, macOS ≥10.15)."""
-    try:
-        os.posix_fallocate(fd, 0, size)
-    except AttributeError:
-        # macOS without posix_fallocate
-        os.ftruncate(fd, size)
-
-
-def _fallocate_windows(fd: int, size: int) -> None:
-    """Use Windows SetFileValidData via ctypes."""
-    import ctypes
-    import ctypes.wintypes as wt
-
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = _get_osfhandle(fd)
-    current_pos = os.lseek(fd, 0, os.SEEK_CUR)
-
-    class LARGE_INTEGER(ctypes.Structure):
-        _fields_ = [("QuadPart", ctypes.c_int64)]
-
-    li = LARGE_INTEGER(size)
-    kernel32.SetFileValidData(handle, li)
-    os.lseek(fd, current_pos, os.SEEK_SET)
-
-
-def _get_osfhandle(fd: int) -> int:
-    """Get Windows HANDLE from file descriptor."""
-    import msvcrt
-    return msvcrt.get_osfhandle(fd)
 
 
 def _fallocate_fallback(fd: int, size: int) -> None:
@@ -97,21 +74,98 @@ def _fallocate_fallback(fd: int, size: int) -> None:
     os.lseek(fd, 0, os.SEEK_SET)
 
 
+def truncate_file(path: str | Path) -> None:
+    """Truncate *path* to zero length (used to restart a download cleanly)."""
+    with open(path, "wb"):
+        pass
+
+
+#: Sidecar holding the per-segment progress of an interrupted download.
+SIDECAR_SUFFIX = ".omnidownloader.json"
+
+
+def sidecar_path(target: str | Path) -> Path:
+    """Path of the resume-state file that belongs to *target*."""
+    return Path(str(target) + SIDECAR_SUFFIX)
+
+
 def get_available_space(path: str | Path) -> int:
     """Return available disk space in bytes at *path*."""
     stat = shutil.disk_usage(str(Path(path).parent))
     return stat.free
 
 
+def file_digest(path: str | Path, algorithm: str = "sha256",
+                chunk_size: int = 1024 * 1024) -> str:
+    """Return the hex digest of *path* (streamed; safe for huge files)."""
+    import hashlib
+
+    digest = hashlib.new(algorithm)
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(chunk_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def parse_checksum(expected: str, path: str | Path | None = None) -> tuple[str, str]:
+    """Split ``"sha256:<hex>"`` (or a bare hex digest) into (algorithm, hex).
+
+    A bare digest is identified by its length, or by the file's size when
+    given (``sha256sum`` files list ``<hex>  <filename>``).
+    """
+    text = (expected or "").strip()
+    if not text:
+        return "", ""
+    if ":" in text:
+        algo, _, value = text.partition(":")
+        return algo.strip().lower(), value.strip().lower()
+    # Bare hex: infer the algorithm from the length.
+    value = text.split()[0].strip().lower()
+    by_length = {32: "md5", 40: "sha1", 64: "sha256", 128: "sha512"}
+    return by_length.get(len(value), "sha256"), value
+
+
+def verify_checksum(path: str | Path, expected: str) -> tuple[bool, str]:
+    """Compare *path*'s digest against *expected*.
+
+    Returns ``(ok, message)``; unsupported algorithms or unreadable files come
+    back as ``(False, reason)`` rather than raising.
+    """
+    import hashlib
+
+    algorithm, want = parse_checksum(expected, path)
+    if not algorithm or not want:
+        return False, "no checksum supplied"
+    if algorithm not in hashlib.algorithms_available:
+        return False, f"unsupported checksum algorithm: {algorithm}"
+    try:
+        got = file_digest(path, algorithm)
+    except OSError as exc:
+        return False, f"could not read {path}: {exc}"
+    if got == want:
+        return True, f"{algorithm} matches"
+    return False, f"{algorithm} mismatch: expected {want}, got {got}"
+
+
 def cleanup_partial_file(path: str | Path) -> None:
-    """Remove a partial/failed download file."""
+    """Remove a partial/failed download (file *or* directory tree).
+
+    Image batches and torrents use a directory as ``job.file_path``, where
+    ``unlink()`` raised IsADirectoryError and the partial tree was never
+    cleaned up.  The resume sidecar is removed too, so a deleted job doesn't
+    leave a stale state file behind.
+    """
     p = Path(path)
-    if p.exists():
-        try:
+    try:
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            logger.info("Cleaned up partial directory: %s", p)
+        elif p.exists():
             p.unlink()
             logger.info("Cleaned up partial file: %s", p)
-        except OSError as exc:
-            logger.warning("Failed to remove %s: %s", p, exc)
+    except OSError as exc:
+        logger.warning("Failed to remove %s: %s", p, exc)
+    sidecar_path(p).unlink(missing_ok=True)
 
 
 def _fmt_size(size: int) -> str:

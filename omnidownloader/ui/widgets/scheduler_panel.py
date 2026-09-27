@@ -59,11 +59,16 @@ class SchedulerPanel(QWidget):
 
         # Add new rule form
         add_group = QGroupBox("Add New Rule")
+        # One layout per widget: the old code called setLayout() twice, so Qt
+        # rejected the second call and every time/speed widget below ended up
+        # parented to a layout that was never installed — invisible, and the
+        # rule's time window and speed could never be changed.
+        add_outer = QVBoxLayout(add_group)
         form = QFormLayout()
         self._name_input = QLineEdit()
         self._name_input.setPlaceholderText("e.g. Night Mode")
         form.addRow("Rule Name:", self._name_input)
-        add_group.setLayout(form)
+        add_outer.addLayout(form)
         root.addWidget(add_group)
 
         # Time row
@@ -89,7 +94,7 @@ class SchedulerPanel(QWidget):
         self._speed_unit.setCurrentText("MB/s")
         speed_row.addWidget(self._speed_unit)
         time_form.addRow("Speed Limit:", speed_row)
-        add_group.setLayout(time_form)
+        add_outer.addLayout(time_form)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()

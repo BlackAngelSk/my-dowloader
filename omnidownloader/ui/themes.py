@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import sys
+import subprocess
 from dataclasses import dataclass
+
+from omnidownloader.core import platform_utils
 
 
 @dataclass
@@ -43,33 +45,49 @@ def get_palette(mode):
     return DARK_COLORS if mode == "dark" else LIGHT_COLORS
 
 def get_system_theme():
-    if sys.platform == "linux":
-        try:
-            import subprocess
-            r = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
-                               capture_output=True, text=True, timeout=2)
-            if "dark" in r.stdout.lower():
+    """The desktop's light/dark preference, or "dark" when it cannot be read.
+
+    The OS branches go through ``platform_utils`` so platform identity lives in
+    exactly one place (and macOS/Linux get their subprocess timeouts, which a
+    hung ``gsettings`` used to make the whole startup wait for).
+    """
+    system = platform_utils.system()
+    if system == platform_utils.LINUX:
+        # GNOME/GTK first; KDE exposes it through the same portal-ish query.
+        for cmd in (
+            ["gsettings", "get", "org.gnome.desktop.interface", "color-scheme"],
+            ["gsettings", "get", "org.gnome.desktop.interface", "gtk-theme"],
+        ):
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True,
+                                        timeout=2, **platform_utils.subprocess_kwargs())
+            except (OSError, subprocess.SubprocessError):
+                continue
+            output = (result.stdout or "").lower()
+            if "dark" in output:
                 return "dark"
-        except Exception:
-            pass
-    elif sys.platform == "win32":
+            if "light" in output:
+                return "light"
+    elif system == platform_utils.WINDOWS:  # pragma: no cover - Windows only
         try:
             import winreg
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+            key = winreg.OpenKey(  # type: ignore[attr-defined]
+                winreg.HKEY_CURRENT_USER,  # type: ignore[attr-defined]
                 r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
-            winreg.CloseKey(key)
+            val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")  # type: ignore[attr-defined]
+            winreg.CloseKey(key)  # type: ignore[attr-defined]
             return "light" if val == 1 else "dark"
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
-    elif sys.platform == "darwin":
+    elif system == platform_utils.MACOS:  # pragma: no cover - macOS only
         try:
-            import subprocess
-            r = subprocess.run(["defaults", "read", "-g", "AppleInterfaceStyle"],
-                               capture_output=True, text=True, timeout=2)
-            if "dark" in r.stdout.lower():
+            result = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                capture_output=True, text=True, timeout=2,
+                **platform_utils.subprocess_kwargs())
+            if "dark" in (result.stdout or "").lower():
                 return "dark"
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             pass
     return "dark"
 

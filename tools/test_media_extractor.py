@@ -109,9 +109,19 @@ async def main() -> int:
         # ── 6. non-YouTube URL is not given YouTube args ─────────
         check("non-YouTube URLs skip client retries",
               MediaExtractor._client_candidates("https://vimeo.com/12345") == (None,))
-        check("YouTube URLs get the full candidate chain",
-              MediaExtractor._client_candidates(VIDEO) ==
-              ("web_embedded", "tv,web_safari", "mweb", "tv_simply"))
+        # The exact list changes as YouTube gates clients, so assert the
+        # properties that matter instead of a frozen tuple: web_embedded leads
+        # (it is the only client exposing the audio ladder), every candidate is
+        # a distinct client, and the known-dead ones stay out.
+        chain = MediaExtractor._client_candidates(VIDEO)
+        check("YouTube URLs get a candidate chain",
+              len(chain) >= 4 and chain[0] == "web_embedded", str(chain))
+        check("player clients are not duplicated", len(set(chain)) == len(chain))
+        check("clients measured as unusable stay out of the chain",
+              not any(c in chain for c in ("android_vr", "tv", "ios")), str(chain))
+        check("the chain includes download-verified fallbacks",
+              any(c and "web_safari" in c for c in chain) and "android" in chain,
+              str(chain))
 
         # ── 7. stale file in the dir isn't reported as the result ─
         stale = tmp / "e"

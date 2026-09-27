@@ -1,73 +1,39 @@
-# OmniDownloader — PyInstaller spec for Windows build
+# OmniDownloader — PyInstaller spec for Windows builds.
+#
 # Produces a single-folder bundle that Inno Setup wraps into an installer.
+# The platform-independent parts (hidden imports, data files, stdlib/DLL
+# discovery) come from build/pyi_common.py so Windows cannot silently miss a
+# module that the Linux/macOS bundles include.
+#
+# Build:  pyinstaller windows.spec --noconfirm --clean
 
-import sys
 import os
-import glob
-from pathlib import Path
+import sys
+
+PROJECT_ROOT = os.path.abspath(os.getcwd())
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "build"))
+
+from pyi_common import DATA_FILES, HIDDEN_IMPORTS, python_dlls, stdlib_pathex  # noqa: E402
 
 block_cipher = None
 
-# ── Force paths so PyInstaller never collides with our build/ folder
-PROJECT_ROOT = os.path.abspath(os.getcwd())
-DISTPATH = os.path.join(PROJECT_ROOT, 'dist')
-WORKPATH = os.path.join(PROJECT_ROOT, 'build', '_pyinstaller_tmp')
-
-# ── Collect Python runtime DLLs (critical for Python 3.14)
-_python_dir = str(Path(sys.executable).parent)
-_python_dlls = []
-for _dll in glob.glob(os.path.join(_python_dir, 'python3*.dll')):
-    _python_dlls.append((_dll, '.'))
-
-# ── Find Python stdlib (encodings, etc.) for Python 3.14
-_lib_dir = os.path.join(_python_dir, '..', 'Lib')
-_lib_dir = os.path.normpath(_lib_dir)
-if os.path.isdir(_lib_dir):
-    _stdlib_pathex = [_lib_dir]
-else:
-    _stdlib_pathex = []
-
+# Python runtime DLLs (critical for Python 3.14): derived from the *base*
+# interpreter inside python_dlls(), so a venv build still bundles python3*.dll.
 a = Analysis(
     ['omnidownloader/__main__.py'],
-    pathex=[str(PROJECT_ROOT)] + _stdlib_pathex,
-    binaries=_python_dlls,
-    datas=[
-        ('omnidownloader/ui', 'omnidownloader/ui'),
-    ],
-    hiddenimports=[
-        'encodings',
-        'encodings.utf_8',
-        'encodings.latin_1',
-        'encodings.ascii',
-        'encodings.cp1252',
-        'PyQt6.QtWidgets',
-        'PyQt6.QtCore',
-        'PyQt6.QtGui',
-        'omnidownloader.core',
-        'omnidownloader.modules',
-        'omnidownloader.services',
-        'omnidownloader.ui',
-        'omnidownloader.ui.pages',
-        'omnidownloader.ui.widgets',
-        'omnidownloader.services.update_service',
-        'omnidownloader.services.dependency_manager',
-        'omnidownloader.services.clipboard_monitor',
-        'omnidownloader.services.ip_checker',
-        'omnidownloader.services.plugin_loader',
-        'omnidownloader.modules.http_downloader',
-        'omnidownloader.modules.media_extractor',
-        'omnidownloader.modules.image_scraper',
-        'omnidownloader.modules.torrent_downloader',
-        'aiohttp',
-        'aiohttp_socks',
-        'aiodns',
-        'packaging',
-        'packaging.version',
-    ],
+    pathex=[PROJECT_ROOT] + stdlib_pathex(),
+    binaries=python_dlls(),
+    datas=DATA_FILES,
+    hiddenimports=HIDDEN_IMPORTS,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        'tkinter',
+        'matplotlib',
+        'numpy',
+        'pytest',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,

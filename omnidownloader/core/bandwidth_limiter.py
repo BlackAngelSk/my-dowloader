@@ -63,15 +63,37 @@ class TokenBucket:
         """Async blocking: wait until *n* tokens are available, then deduct."""
         if self.is_unlimited or n <= 0:
             return
+        if self._capacity > 0 and n > self._capacity:
+            # A single chunk larger than the bucket can never fit.  Wait for a
+            # full bucket, drain it, and allow the overshoot — without this the
+            # loop below can never satisfy ``tokens >= n`` and the transfer
+            # stalls forever whenever the rate cap is smaller than one chunk
+            # (e.g. a 25 KB/s per-task share against 256 KB reads).
+            await self._acquire_oversized()
+            return
         while True:
             self._refill()
             with self._lock:
                 if self._tokens >= n:
                     self._tokens -= n
                     return
-            deficit = n - self._tokens
+                deficit = n - self._tokens
             wait_time = deficit / self._rate if self._rate > 0 else 0.05
-            await asyncio.sleep(min(wait_time, 0.05))
+            await asyncio.sleep(min(max(wait_time, 0.001), 0.05))
+
+    async def _acquire_oversized(self) -> None:
+        """Drain a full bucket and let the oversized request through."""
+        while True:
+            if self.is_unlimited or self._capacity <= 0:
+                return
+            self._refill()
+            with self._lock:
+                if self._tokens >= self._capacity:
+                    self._tokens = 0.0
+                    return
+                deficit = self._capacity - self._tokens
+            wait = deficit / self._rate if self._rate > 0 else 0.05
+            await asyncio.sleep(min(max(wait, 0.001), 0.05))
 
     def reset(self) -> None:
         with self._lock:
@@ -106,6 +128,31 @@ class BandwidthManager:
     def __init__(self, global_rate: float = 0.0) -> None:
         self._global = TokenBucket(rate=global_rate)
         self._task_limiters: dict[str, TokenBucket] = {}
+        self._default_task_rate: float = 0.0
+
+    @property
+    def default_task_rate(self) -> float:
+        return self._default_task_rate
+
+    def set_default_task_rate(self, rate: float) -> None:
+        """Cap every per-task bucket at *rate* (0 = unlimited).
+
+        Backs the settings panel's "Per-Task Speed Limit", which used to be
+        collected and then silently ignored.
+        """
+        self._default_task_rate = max(0.0, float(rate))
+        for bucket in self._task_limiters.values():
+            bucket.set_rate(self._default_task_rate)
+        logger.info(
+            "Default per-task cap: %s",
+            f"{self._default_task_rate / 1024:.1f} KB/s"
+            if self._default_task_rate > 0 else "unlimited",
+        )
+
+    def set_all_task_rates(self, rate: float) -> None:
+        """Apply *rate* to every existing per-task bucket (scheduler rules)."""
+        for bucket in self._task_limiters.values():
+            bucket.set_rate(rate)
 
     @property
     def global_rate(self) -> float:
@@ -124,7 +171,10 @@ class BandwidthManager:
         await self._global.acquire(byte_count)
 
     def create_task_limiter(self, job_id: str, rate: float = 0.0) -> TokenBucket:
-        bucket = TokenBucket(rate=rate)
+        # Fall back to the configured default cap when no explicit rate is
+        # given, so the setting applies to new downloads too.
+        effective = rate if rate > 0 else self._default_task_rate
+        bucket = TokenBucket(rate=effective)
         self._task_limiters[job_id] = bucket
         return bucket
 
@@ -154,7 +204,9 @@ class BandwidthManager:
     ) -> None:
         """Assign a per-task rate based on priority weight share."""
         if available_bw <= 0:
-            self.set_task_rate(job_id, 0.0)
+            # No global cap — fall back to the configured default per-task
+            # limit rather than silently clearing it to "unlimited".
+            self.set_task_rate(job_id, self._default_task_rate)
             return
         share = (weight / total_weight) * available_bw if total_weight > 0 else available_bw
         self.set_task_rate(job_id, share)

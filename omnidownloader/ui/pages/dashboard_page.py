@@ -17,6 +17,8 @@ class DashboardPage(QWidget):
     """Main dashboard with URL input, speed graph, and download cards."""
 
     url_submitted = pyqtSignal(str)
+    #: Forwarded from the input bar when the user supplied a checksum.
+    url_submitted_with_checksum = pyqtSignal(str, str)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -31,6 +33,7 @@ class DashboardPage(QWidget):
         # ── URL Input Bar ────────────────────────────────────
         self._input_bar = URLInputBar()
         self._input_bar.url_submitted.connect(self.url_submitted.emit)
+        self._input_bar.url_with_checksum.connect(self.url_submitted_with_checksum.emit)
         root.addWidget(self._input_bar)
 
         # ── Speed Graph ──────────────────────────────────────

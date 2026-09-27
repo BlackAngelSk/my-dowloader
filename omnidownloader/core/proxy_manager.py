@@ -112,15 +112,39 @@ class ProxyManager(QObject):
         if enabled:
             self._config.proxy_type = ProxyType.SOCKS5
             self._config.host = "127.0.0.1"
-            self._config.port = 9050
+            self._config.port = self._tor_socks_port()
             self._config.enabled = True
             self._config.dns_leak_protection = True
+        elif (self._config.host == "127.0.0.1"
+              and self._config.port == self._tor_socks_port()):
+            # Disabling Tor used to leave the proxy configured, so every module
+            # kept routing through a stopped Tor instance.
+            self._config.enabled = False
         logger.info("Tor %s", "enabled" if enabled else "disabled")
 
+    def set_kill_switch_interval(self, seconds: int) -> None:
+        """Set the proxy health-check interval in seconds."""
+        try:
+            interval = max(5, int(seconds))
+        except (TypeError, ValueError):
+            return
+        self._kill_switch_interval = float(interval)
+        logger.info("Kill-switch check interval: %ss", interval)
+
+    def _tor_socks_port(self) -> int:
+        """Use the port the Tor manager was actually configured with."""
+        tor = getattr(self, "_tor_manager", None)
+        return int(getattr(tor, "_socks_port", 9050) or 9050)
+
     def set_kill_switch(self, enabled: bool) -> None:
+        """Enable/disable the kill switch (called from the GUI thread)."""
         self._kill_switch_enabled = enabled
         if enabled and self._health_task is None:
-            asyncio.ensure_future(self._start_health_monitor())
+            # Must not build a future here: this slot runs on the Qt thread,
+            # which has no running event loop — it raised RuntimeError, so the
+            # monitor never started and nothing was ever paused.
+            import omnidownloader.main as main_mod
+            main_mod.schedule_async(self._start_health_monitor())
         elif not enabled and self._health_task:
             self._health_task.cancel()
             self._health_task = None
@@ -128,7 +152,7 @@ class ProxyManager(QObject):
     def get_proxy_url(self) -> str:
         """Return the active proxy URL string for subprocess args."""
         if self._tor_enabled:
-            return "socks5://127.0.0.1:9050"
+            return f"socks5://127.0.0.1:{self._tor_socks_port()}"
         return self._config.to_url()
 
     def get_aiohttp_connector(self):
@@ -136,17 +160,12 @@ class ProxyManager(QObject):
         if not self.enabled:
             return None
         try:
-            from aiohttp_socks import ProxyConnector, ProxyType as AioProxyType
+            from aiohttp_socks import ProxyConnector
             url = self.get_proxy_url()
             if not url:
                 return None
-            ptype = self._config.proxy_type
-            aio_type = {
-                ProxyType.SOCKS4: AioProxyType.SOCKS4,
-                ProxyType.SOCKS5: AioProxyType.SOCKS5,
-                ProxyType.HTTP: AioProxyType.HTTP,
-                ProxyType.HTTPS: AioProxyType.HTTP,
-            }.get(ptype, AioProxyType.SOCKS5)
+            # from_url derives the scheme (socks4/socks5/http) from the URL;
+            # the manually computed type here was dead code.
             return ProxyConnector.from_url(url)
         except ImportError:
             logger.warning("aiohttp-socks not installed; proxy routing disabled for aiohttp")

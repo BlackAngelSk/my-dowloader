@@ -29,8 +29,22 @@ class UpdateDialog(QDialog):
         super().__init__(parent)
         self._info = info
         self._svc = update_service
+        self._current_version = self._read_app_version()
         self._setup_ui()
         self._connect_signals()
+
+    @staticmethod
+    def _read_app_version() -> str:
+        """The running app's version (was hard-coded as 0.1.0)."""
+        try:
+            from PyQt6.QtWidgets import QApplication
+            inst = QApplication.instance()
+            version = inst.applicationVersion() if inst is not None else ""
+            if version:
+                return version
+        except Exception:  # noqa: BLE001
+            pass
+        return "unknown"
 
     def _setup_ui(self) -> None:
         self.setWindowTitle("Update Available")
@@ -51,7 +65,7 @@ class UpdateDialog(QDialog):
         layout.addWidget(header)
 
         version_info = QLabel(
-            f"<b>Current version:</b> 0.1.0 &nbsp;&nbsp;→&nbsp;&nbsp; "
+            f"<b>Current version:</b> {self._current_version} &nbsp;&nbsp;→&nbsp;&nbsp; "
             f"<b>New version:</b> {self._info.version}"
         )
         version_info.setWordWrap(True)

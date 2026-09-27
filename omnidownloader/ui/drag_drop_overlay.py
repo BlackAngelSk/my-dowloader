@@ -1,10 +1,24 @@
-"""Drag-and-drop overlay widget for dropping .torrent files and URLs."""
+"""Drag-and-drop overlay widget for dropping .torrent files, URL lists and URLs."""
 
 from __future__ import annotations
+
+import logging
+import re
+from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
+
+logger = logging.getLogger(__name__)
+
+#: URLs we can actually hand to a module.
+URL_RE = re.compile(r'(https?://[^\s<>"\']+|magnet:\?[^\s<>"\']+)', re.IGNORECASE)
+
+#: Dropped text files we treat as link lists.
+LIST_SUFFIXES = (".txt", ".list", ".urls", ".csv", ".md")
+#: Dropped files that a download module can consume directly.
+FILE_SUFFIXES = (".torrent",)
 
 
 class DragDropOverlay(QWidget):
@@ -18,7 +32,7 @@ class DragDropOverlay(QWidget):
         self.hide()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         layout = QVBoxLayout(self)
-        label = QLabel("\U0001f4c2\nDrop files, .torrent, or URLs here")
+        label = QLabel("\U0001f4c2\nDrop files, .torrent, URL lists, or URLs here")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setStyleSheet(
             "font-size: 20px; font-weight: bold; color: #F1F5F9;"
@@ -52,22 +66,54 @@ class DragDropOverlay(QWidget):
         mime = a0.mimeData()
         if mime is None:
             return
+
+        files: list[str] = []
+        urls: list[str] = []
+        list_files: list[Path] = []
+
         if mime.hasUrls():
-            files = []
-            urls = []
             for url in mime.urls():
                 path = url.toLocalFile()
-                if path:
-                    files.append(path)
-                else:
+                if not path:
                     urls.append(url.toString())
-            if files:
-                self.files_dropped.emit(files)
-            if urls:
-                self.urls_dropped.emit(urls)
-        elif mime.hasText():
-            text = mime.text().strip()
-            if text:
-                self.urls_dropped.emit([text])
+                    continue
+                lowered = path.lower()
+                if lowered.endswith(FILE_SUFFIXES):
+                    # A module (torrent) handles a bare filesystem path.
+                    files.append(path)
+                elif lowered.endswith(LIST_SUFFIXES):
+                    list_files.append(Path(path))
+                else:
+                    files.append(path)
+
+        if mime.hasText():
+            urls.extend(self.extract_urls(mime.text()))
+
+        for list_file in list_files:
+            try:
+                content = list_file.read_text(errors="replace")
+            except OSError as exc:
+                logger.warning("Could not read dropped file %s: %s", list_file, exc)
+                continue
+            found = self.extract_urls(content)
+            logger.info("Read %d URL(s) from dropped %s", len(found), list_file.name)
+            urls.extend(found)
+
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        urls = [u for u in urls if not (u in seen or seen.add(u))]
+
+        if files:
+            self.files_dropped.emit(files)
+        if urls:
+            self.urls_dropped.emit(urls)
         a0.acceptProposedAction()
 
+    @staticmethod
+    def extract_urls(text: str) -> list[str]:
+        """Pull every downloadable URL out of *text*.
+
+        A dropped text file used to be handed to the queue whole, so a pasted
+        list of twenty links became one nonsense job.
+        """
+        return [match.group(0).rstrip('.,;:)"\'') for match in URL_RE.finditer(text or "")]

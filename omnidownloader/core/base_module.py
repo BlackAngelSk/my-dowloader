@@ -75,6 +75,9 @@ class BaseDownloaderModule(ABC):
     async def cancel(self, job: DownloadJob) -> None:
         """Cancel a download and clean up partial files (default: no-op)."""
 
+    async def close(self) -> None:
+        """Release long-lived resources (HTTP sessions, handles). Default: no-op."""
+
     # ── Utility ───────────────────────────────────────────────
 
     def display_name(self) -> str:

@@ -102,6 +102,11 @@ class HistoryPage(QWidget):
         root.addWidget(scroll, 1)
 
     def add_job(self, job: DownloadJob) -> None:
+        # A cancelled job emits "cancelled" twice (once from cancel_job, once
+        # from the cancelled task), which produced two cards for one job and
+        # orphaned the first one in the layout forever.
+        if job.id in self._cards:
+            return
         card = HistoryCard(job)
         card.open_folder_clicked.connect(self.open_folder_clicked.emit)
         card.remove_clicked.connect(self.remove_clicked.emit)

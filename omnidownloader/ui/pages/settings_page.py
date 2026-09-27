@@ -25,6 +25,10 @@ class SettingsPage(QWidget):
             self._panel._dir_input.setText(settings["download_dir"])
         if "max_concurrent" in settings:
             self._panel._concurrent_spin.setValue(settings["max_concurrent"])
+        if "speed_limit_kbs" in settings:
+            self._panel._speed_limit.setText(settings["speed_limit_kbs"])
+        if "per_task_limit_kbs" in settings:
+            self._panel._per_task_limit.setText(settings["per_task_limit_kbs"])
         if "theme" in settings:
             idx = {"auto": 0, "dark": 1, "light": 2}.get(settings["theme"], 0)
             self._panel._theme_combo.setCurrentIndex(idx)

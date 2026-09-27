@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+from omnidownloader.core import platform_utils
 from omnidownloader.core.base_module import BaseDownloaderModule
 from omnidownloader.core.disk_utils import ensure_directory
 from omnidownloader.core.models import DownloadJob, DownloadState
@@ -23,7 +23,7 @@ except ImportError:
     lt = None  # type: ignore[assignment]
     HAS_LIBTORRENT = False
 
-HAS_ARIA2C = shutil.which("aria2c") is not None
+HAS_ARIA2C = bool(platform_utils.find_aria2c())
 if not HAS_LIBTORRENT and not HAS_ARIA2C:
     logger.warning("Neither libtorrent nor aria2c found — torrent downloads unavailable")
 
@@ -42,6 +42,8 @@ class TorrentDownloader(BaseDownloaderModule):
         self._cancel_flags: dict[str, bool] = {}
         self._proxy_manager = proxy_manager
         self._bw = bandwidth_manager
+        # Resolved once: Windows needs aria2c.exe, which PATH lookup handles.
+        self._aria2c = platform_utils.find_aria2c()
 
     def can_handle(self, url: str) -> bool:
         if not HAS_LIBTORRENT and not HAS_ARIA2C:
@@ -86,16 +88,21 @@ class TorrentDownloader(BaseDownloaderModule):
             await self._dl_lt(job, progress_callback)
         else:
             job.state = DownloadState.FAILED
-            job.error_message = "Install aria2 (pacman -S aria2) for torrent support"
+            job.error_message = (
+                "Torrent support needs aria2c (" + platform_utils.install_hint("aria2c")
+                + ") or the python libtorrent bindings ("
+                + platform_utils.install_hint("libtorrent") + ")."
+            )
             return
 
     async def _dl_aria2(self, job, progress_callback):
         job.state = DownloadState.DOWNLOADING
-        cmd = ["aria2c", "--dir", self._save_path, "--seed-time=0",
+        cmd = [self._aria2c or "aria2c", "--dir", self._save_path, "--seed-time=0",
                "--bt-stop-timeout=300", "--summary-interval=1",
                "--enable-color=false", "--console-log-level=notice",
                "--continue=true"]
         if self._max_download > 0:
+            # ``max_download_rate`` is a KiB/s budget (as the CLI flag expects).
             cmd += ["--max-overall-download-limit", f"{self._max_download}K"]
         if self._proxy_manager and self._proxy_manager.enabled:
             proxy = self._proxy_manager.get_proxy_url()
@@ -105,25 +112,42 @@ class TorrentDownloader(BaseDownloaderModule):
         logger.info("Starting aria2c torrent download")
 
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            *cmd, **platform_utils.subprocess_kwargs(),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
-        if proc.stdout:
-            async for line in proc.stdout:
-                if self._cancel_flags.get(job.id, False):
-                    proc.terminate()
-                    await proc.wait()
-                    raise asyncio.CancelledError()
-                text = line.decode(errors="replace").strip()
-                if "(" in text and "%" in text:
-                    try:
-                        pct = float(text.split("(")[1].split("%")[0])
-                        job.progress_percent = pct
-                    except (IndexError, ValueError):
-                        pass
-                    if progress_callback:
-                        progress_callback(job)
+        # Drain stderr: aria2c writes there freely, and once the 64 KiB pipe
+        # buffer fills it blocks forever — stdout never closes and the
+        # download hangs with no error.
+        async def _drain(stream) -> None:
+            if stream is None:
+                return
+            while await stream.read(4096):
+                pass
 
-        await proc.wait()
+        drain_task = asyncio.create_task(_drain(proc.stderr))
+        try:
+            if proc.stdout:
+                async for line in proc.stdout:
+                    if self._cancel_flags.get(job.id, False):
+                        # Kill the tree: aria2c spawns helper processes.
+                        platform_utils.kill_process_tree(proc)
+                        await proc.wait()
+                        raise asyncio.CancelledError()
+                    text = line.decode(errors="replace").strip()
+                    if "(" in text and "%" in text:
+                        try:
+                            pct = float(text.split("(")[1].split("%")[0])
+                            job.progress_percent = pct
+                        except (IndexError, ValueError):
+                            pass
+                        if progress_callback:
+                            progress_callback(job)
+            await proc.wait()
+        finally:
+            drain_task.cancel()
+            self._cancel_flags.pop(job.id, None)
+        if proc.returncode not in (0, None):
+            raise RuntimeError(f"aria2c exited with code {proc.returncode}")
 
     async def _dl_lt(self, job, progress_callback):
         assert lt is not None  # guarded by HAS_LIBTORRENT
@@ -143,14 +167,11 @@ class TorrentDownloader(BaseDownloaderModule):
         job.file_path = str(Path(self._save_path) / job.file_name)
         self._handles[job.id] = handle
 
-        # Sequential download mode: prioritize pieces in order
+        # Sequential download mode
         if job.sequential:
-            handle.set_flags(lt.sequential_download)
-            num_pieces = tf.num_pieces() if tf else 0
-            # Set piece priorities: all pieces to normal priority
-            for i in range(num_pieces):
-                handle.piece_priority(i, 4)  # 4 = top_priority
-            logger.info("Torrent sequential mode enabled for %d pieces", num_pieces)
+            # OR the flag in — set_flags(x) replaces every flag on the handle.
+            handle.set_flags(handle.flags() | lt.sequential_download)
+            logger.info("Torrent sequential mode enabled")
 
         # Create streaming buffer for in-progress file
         from omnidownloader.core.streaming_buffer import StreamingBuffer
@@ -181,21 +202,42 @@ class TorrentDownloader(BaseDownloaderModule):
     def _get_lt(self) -> Any:
         if self._session is None:
             assert lt is not None  # guarded by HAS_LIBTORRENT
-            settings = {"listen_interfaces": f"0.0.0.0:{self._listen_port}",
-                        "enable_dht": True, "enable_lsd": True,
-                        "enable_natpmp": True, "enable_upnp": True}
+            settings = {"listen_interfaces": f"0.0.0.0:{self._listen_port}"}
+            proxy_cfg = {}
+            if self._proxy_manager and self._proxy_manager.enabled:
+                # Route libtorrent through the proxy and disable the discovery
+                # mechanisms that would otherwise announce the real IP.
+                proxy_cfg = self._proxy_manager.get_libtorrent_proxy_settings()
+                settings.update({"enable_dht": False, "enable_lsd": False,
+                                 "enable_natpmp": False, "enable_upnp": False})
+            else:
+                settings.update({"enable_dht": True, "enable_lsd": True,
+                                 "enable_natpmp": True, "enable_upnp": True})
+            settings.update(proxy_cfg)
             self._session = lt.session(settings)
-            self._session.add_dht_router("router.bittorrent.com", 6881)
-            self._session.add_dht_router("dht.transmissionbt.com", 6881)
-            self._session.start_dht()
-            self._session.start_lsd()
-            self._session.start_upnp()
-            self._session.start_natpmp()
+            if not proxy_cfg:
+                self._session.add_dht_router("router.bittorrent.com", 6881)
+                self._session.add_dht_router("dht.transmissionbt.com", 6881)
+                self._session.start_dht()
+                self._session.start_lsd()
+                self._session.start_upnp()
+                self._session.start_natpmp()
         return self._session
 
     async def cancel(self, job):
+        # Set the flag and leave it: _dl_lt/_dl_aria2 poll it and clear it
+        # themselves.  Popping it here meant the loop kept seeing False and
+        # the torrent ran on forever.
         self._cancel_flags[job.id] = True
-        handle = self._handles.pop(job.id, None)
+        handle = self._handles.get(job.id)
         if handle and self._session:
-            self._session.remove_torrent(handle)
-        self._cancel_flags.pop(job.id, None)
+            try:
+                self._session.remove_torrent(handle)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("remove_torrent failed for %s: %s", job.id, exc)
+
+    async def close(self) -> None:
+        """Release the libtorrent session."""
+        self._handles.clear()
+        self._cancel_flags.clear()
+        self._session = None

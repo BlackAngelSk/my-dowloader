@@ -79,6 +79,19 @@ class SettingsPanel(QWidget):
         self._check_update_btn.setObjectName("primaryButton")
         update_layout.addWidget(self._check_update_btn)
 
+        # yt-dlp's extractors break whenever a platform changes its API, so
+        # updating it is a first-class action rather than an afterthought.
+        self._update_ytdlp_btn = QPushButton("Update yt-dlp")
+        self._update_ytdlp_btn.setObjectName("iconButton")
+        self._update_ytdlp_btn.setToolTip(
+            "Fetch the latest yt-dlp release (extractors change often)"
+        )
+        update_layout.addWidget(self._update_ytdlp_btn)
+
+        self._ytdlp_label = QLabel("")
+        self._ytdlp_label.setObjectName("muted")
+        update_layout.addWidget(self._ytdlp_label)
+
         update_group.setLayout(update_layout)
         root.addWidget(update_group)
 

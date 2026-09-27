@@ -5,8 +5,10 @@ __pycache__/
 *.egg-info/
 *.egg
 dist/
-build/
 *.spec.bak
+# NOTE: build/ holds tracked sources (specs' shared helper, install scripts,
+# the .desktop entry, installer.iss, build_windows.bat).  Only PyInstaller's
+# work directories are ignored — see the bottom of this file.
 
 # Virtual environments
 .venv/
@@ -28,5 +30,10 @@ Thumbs.db
 omnidownloader.log
 *.log
 
-# PyInstaller artifacts
+# PyInstaller artifacts (work dirs only — build/*.py|.sh|.bat|.iss are tracked)
 build/_pyinstaller_tmp/
+build/linux/
+build/macos/
+build/windows/
+build/OmniDownloader/
+build/__pycache__/

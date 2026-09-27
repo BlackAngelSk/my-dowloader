@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=OmniDownloader
+GenericName=Download Manager
+Comment=Fast modular download manager (HTTP, torrents, video)
+Exec=OmniDownloader %u
+Icon=omnidownloader
+Terminal=false
+Categories=Network;FileTransfer;P2P;
+MimeType=application/x-bittorrent;x-scheme-handler/magnet;
+Keywords=download;torrent;magnet;youtube;video;
+StartupNotify=true
