@@ -167,6 +167,30 @@ class DownloadCard(QFrame):
         c = _STATE_COLORS.get(self._job.state, "#64748B")
         self._dot.setStyleSheet(f"background-color: {c}; border-radius: 4px;")
 
+    def _size_text(self, j) -> str:
+        """``done / total`` line, using the size the quality dialog estimated.
+
+        yt-dlp only reports the real size once its progress lines start, so a
+        media job used to sit at "? / ?" for the first seconds.  The dialog now
+        stores ``estimated_size`` on the job; show it (marked with ≈) until the
+        real byte count arrives.
+        """
+        if j.file_size > 0:
+            return f"{_fmt_size(j.downloaded_bytes)} / {_fmt_size(j.file_size)}"
+        est = 0
+        if isinstance(j.metadata, dict):
+            try:
+                est = int(j.metadata.get("estimated_size") or 0)
+            except (TypeError, ValueError):
+                est = 0
+        if est > 0 and j.state in (DownloadState.PENDING, DownloadState.EXTRACTING,
+                                   DownloadState.DOWNLOADING, DownloadState.PAUSED):
+            # Show bytes downloaded against the estimate, not the "?"
+            # placeholder a zero file_size produces.
+            done = _fmt_size(j.downloaded_bytes) if j.downloaded_bytes > 0 else "0 B"
+            return f"{done} / ≈{_fmt_size(est)}"
+        return f"{_fmt_size(j.downloaded_bytes)} / {_fmt_size(j.file_size)}"
+
     def update_progress(self):
         j = self._job
         self._update_dot()
@@ -178,7 +202,7 @@ class DownloadCard(QFrame):
             self._title.setText(j.file_name or j.url[:60])
         self._bar.setValue(int(j.progress_percent * 10))
         self._speed_lbl.setText(_fmt_speed(j.speed_bps))
-        self._size_lbl.setText(f"{_fmt_size(j.downloaded_bytes)} / {_fmt_size(j.file_size)}")
+        self._size_lbl.setText(self._size_text(j))
         # A torrent that is waiting for peers/seeders has no ETA and no speed:
         # showing "ETA: —" at a frozen 0% is what made a dead torrent look like
         # a broken app.  The module sets status_note while it waits.
