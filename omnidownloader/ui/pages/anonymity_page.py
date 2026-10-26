@@ -14,16 +14,23 @@ class AnonymityPage(QWidget):
     kill_switch_interval_changed = pyqtSignal(int)
     ip_check_requested = pyqtSignal()
     tor_rotate_requested = pyqtSignal()
+    #: Automatic proxy discovery: turn it on/off, or run one search now.
+    auto_proxy_toggle = pyqtSignal(bool)
+    auto_proxy_find_now = pyqtSignal()
     #: Emitted from the asyncio engine thread; connected to the QLabel
     #: updaters below so widget mutation always happens on the GUI thread.
     ip_info_ready = pyqtSignal(str, str, str)
     tor_status_ready = pyqtSignal(bool, bool)
+    auto_proxy_status_ready = pyqtSignal(str)
+    auto_proxy_found_ready = pyqtSignal(str, str, float, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._build_ui()
         self.ip_info_ready.connect(self.update_ip_info)
         self.tor_status_ready.connect(self.update_tor_status)
+        self.auto_proxy_status_ready.connect(self.update_auto_proxy_status)
+        self.auto_proxy_found_ready.connect(self.update_auto_proxy_found)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -54,6 +61,34 @@ class AnonymityPage(QWidget):
         sl.addLayout(br)
         sg.setLayout(sl)
         root.addWidget(sg)
+
+        # Automatic proxy discovery — the user does not have to know a single
+        # host: the app finds a working one, proves it works and uses it.
+        ag = QGroupBox("Automatic Proxy (find one and use it)")
+        al = QVBoxLayout()
+        ar = QHBoxLayout()
+        self._auto_btn = QPushButton("OFF")
+        self._auto_btn.setCheckable(True)
+        self._auto_btn.setFixedWidth(60)
+        self._auto_btn.setToolTip(
+            "Search public proxy lists, keep only the proxies that answer\n"
+            "through a real hop, and route every download through the fastest one."
+        )
+        self._auto_btn.clicked.connect(self._on_auto_toggled)
+        ar.addWidget(QLabel("Enable:"))
+        ar.addWidget(self._auto_btn)
+        self._auto_find_btn = QPushButton("🔍 Find proxy now")
+        self._auto_find_btn.setObjectName("iconButton")
+        self._auto_find_btn.clicked.connect(self.auto_proxy_find_now.emit)
+        ar.addWidget(self._auto_find_btn)
+        ar.addStretch()
+        al.addLayout(ar)
+        self._auto_status = QLabel("⚪ Off — no proxy in use")
+        self._auto_status.setObjectName("subtitle")
+        self._auto_status.setWordWrap(True)
+        al.addWidget(self._auto_status)
+        ag.setLayout(al)
+        root.addWidget(ag)
 
         # Proxy Configuration
         pg = QGroupBox("Proxy Configuration")
@@ -136,6 +171,57 @@ class AnonymityPage(QWidget):
         dg.setLayout(df)
         root.addWidget(dg)
         root.addStretch()
+
+    def _on_auto_toggled(self):
+        enabled = self._auto_btn.isChecked()
+        self._auto_btn.setText("ON" if enabled else "OFF")
+        self.set_auto_enabled_state(enabled)
+        self._auto_status.setText(
+            "⏳ Searching for a working proxy…" if enabled
+            else "⚪ Off — no proxy in use"
+        )
+        self.auto_proxy_toggle.emit(enabled)
+
+    def set_auto_enabled_state(self, enabled: bool):
+        """Reflect the toggle without emitting (used when restoring settings)."""
+        self._auto_btn.setChecked(enabled)
+        self._auto_btn.setText("ON" if enabled else "OFF")
+        # While the app is choosing the endpoint, the manual fields are
+        # read-only mirrors of what was found — otherwise the two settings
+        # silently fight over the proxy config.
+        for widget in (self._proxy_type, self._proxy_host, self._proxy_port,
+                       self._proxy_user, self._proxy_pass, self._proxy_enabled):
+            widget.setEnabled(not enabled)
+        self._auto_find_btn.setText(
+            "🔍 Find another" if enabled else "🔍 Find proxy now"
+        )
+
+    def update_auto_proxy_status(self, message: str):
+        self._auto_status.setText(message or "")
+
+    def update_auto_proxy_found(self, url: str, label: str, latency: float, exit_ip: str):
+        """Show the discovered proxy, and mirror it into the manual fields."""
+        self._auto_status.setText(
+            f"✅ Using {label}  •  {latency:.0f} ms  •  exit {exit_ip or 'unknown'}"
+        )
+        type_text = {"socks5": "SOCKS5", "socks4": "SOCKS4",
+                     "http": "HTTP", "https": "HTTPS"}.get(
+            (url.split("://")[0] if "://" in url else "http").lower(), "HTTP")
+        host, _, port_text = label.rpartition("://")[2].partition(":")
+        try:
+            port = int(port_text)
+        except ValueError:
+            port = 0
+        for widget in (self._proxy_type, self._proxy_host, self._proxy_port):
+            widget.blockSignals(True)
+        self._proxy_type.setCurrentText(type_text)
+        self._proxy_host.setText(host)
+        if port:
+            self._proxy_port.setValue(port)
+        for widget in (self._proxy_type, self._proxy_host, self._proxy_port):
+            widget.blockSignals(False)
+        self._proxy_enabled.setChecked(True)
+        self._proxy_enabled.setText("ON")
 
     def _on_proxy_toggled(self):
         enabled = self._proxy_enabled.isChecked()

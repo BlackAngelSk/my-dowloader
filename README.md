@@ -14,6 +14,10 @@
 - 🧲 **Torrents & Magnet Links** — magnet links resolve to a real name, size and file
   list (libtorrent, or aria2c plus the bundled metadata reader), with live progress
 - 🖼️ **Image Scraper** — Batch image gallery downloader with deduplication
+- 🕵️ **Automatic Proxy** — Finds a working public proxy for you and routes every
+  download through it (each candidate is proven by pushing a real request
+  through it; transparent proxies are rejected), with health re-checks and
+  automatic replacement when one dies
 - 🎨 **Dark & Light Mode** — System-aware theme switching with polished QSS stylesheets
 - 📋 **Clipboard Monitor** — Auto-detects copied URLs (including magnets) and prompts to download
 - 📂 **Drag & Drop** — Drop .torrent files, or text files containing a list of links
@@ -162,6 +166,8 @@ Note that built-ins are *imported*, so packaging them into a frozen bundle (see
 .venv/bin/python tools/test_media_extractor.py    # live YouTube download
 .venv/bin/python tools/test_playlists.py          # playlist → child jobs
 .venv/bin/python tools/test_persistence.py        # config + history
+.venv/bin/python tools/test_proxy_finder.py       # proxy discovery + validation (offline, local proxies)
+.venv/bin/python tools/test_proxy_finder.py --live # + a real search against public lists
 .venv/bin/python tools/test_magnet.py             # magnet/torrent handling (offline)
 .venv/bin/python tools/test_magnet.py --live "magnet:?xt=urn:btih:..."   # + a real magnet
 .venv/bin/python tools/test_cross_platform.py     # Linux/macOS/Windows behaviour

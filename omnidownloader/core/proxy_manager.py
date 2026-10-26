@@ -75,6 +75,11 @@ class ProxyManager(QObject):
     kill_switch_triggered = pyqtSignal(str)          # reason
     kill_switch_cleared = pyqtSignal()
     ip_changed = pyqtSignal(str, str, str)           # ip, country, isp
+    #: Automatic proxy discovery (find one and use it without the user typing
+    #: anything).  ``url, label, latency_ms, exit_ip``.
+    auto_proxy_found = pyqtSignal(str, str, float, str)
+    #: Human-readable progress line for the anonymity page.
+    auto_proxy_status = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -86,6 +91,20 @@ class ProxyManager(QObject):
         self._last_check = ProxyCheckResult()
         self._paused_by_kill_switch: bool = False
         self._tor_manager: Any = None  # set by main.py
+        self._auto_discover = False
+        self._auto_task: Optional[asyncio.Task] = None
+        self._finder: Any = None  # injectable for tests
+        self._auto_candidate: Any = None
+        self._auto_recheck_interval = 180.0
+
+    @property
+    def auto_discovery_enabled(self) -> bool:
+        return self._auto_discover
+
+    @property
+    def auto_candidate(self):
+        """The proxy the automatic search settled on (or ``None``)."""
+        return self._auto_candidate
 
     @property
     def config(self) -> ProxyConfig:
@@ -154,6 +173,129 @@ class ProxyManager(QObject):
         if self._tor_enabled:
             return f"socks5://127.0.0.1:{self._tor_socks_port()}"
         return self._config.to_url()
+
+    # ── Automatic proxy discovery ───────────────────────────────
+    #
+    # Free proxies are found, proven to work (a request is actually pushed
+    # through them) and then kept alive by re-checking; when one dies, the
+    # next search replaces it.  Everything runs on the engine loop, and the
+    # results leave the manager as signals so the GUI thread never waits.
+
+    def set_auto_discovery(self, enabled: bool) -> None:
+        """Turn automatic proxy discovery on/off (GUI thread safe).
+
+        Re-enabling is honoured even when the flag was already restored from
+        the config file at startup: what matters is whether the search loop is
+        actually running, not the flag alone.
+        """
+        if enabled:
+            if self._auto_discover and self._auto_task is not None \
+                    and not self._auto_task.done():
+                return
+            self._auto_discover = True
+            import omnidownloader.main as main_mod
+            main_mod.schedule_async(self._auto_discovery_loop())
+        else:
+            if not self._auto_discover and self._auto_task is None:
+                return
+            self._auto_discover = False
+            task, self._auto_task = self._auto_task, None
+            if task is not None and not task.done():
+                task.cancel()
+            self._auto_candidate = None
+            self.auto_proxy_status.emit("Automatic proxy discovery off")
+            logger.info("Automatic proxy discovery disabled")
+
+    def set_finder(self, finder) -> None:
+        """Inject a :class:`ProxyFinder` (tests use a stub)."""
+        self._finder = finder
+
+    def _get_finder(self):
+        if self._finder is None:
+            from omnidownloader.services.proxy_finder import ProxyFinder
+            self._finder = ProxyFinder()
+        return self._finder
+
+    async def discover_proxy(self):
+        """Run one search and adopt the result.  Returns the candidate or None.
+
+        Used both by the automatic loop and by the page's "Find now" button.
+        """
+        if self._tor_enabled:
+            # Tor already owns the tunnel; replacing its config would break it.
+            self.auto_proxy_status.emit("Tor is on — automatic proxy not used")
+            return None
+        finder = self._get_finder()
+        self.auto_proxy_status.emit("Searching for a working proxy…")
+        candidate = await finder.find_best()
+        if candidate is None:
+            self.auto_proxy_status.emit(
+                "No working proxy found — every candidate was dead or transparent"
+            )
+            return None
+        self.adopt_proxy(candidate)
+        return candidate
+
+    def adopt_proxy(self, candidate) -> None:
+        """Route all traffic through *candidate* and announce it."""
+        self._config = ProxyConfig(
+            proxy_type=candidate.proxy_type,
+            host=candidate.host,
+            port=candidate.port,
+            username=getattr(candidate, "username", "") or "",
+            password=getattr(candidate, "password", "") or "",
+            enabled=True,
+            dns_leak_protection=True,
+        )
+        self._auto_candidate = candidate
+        country = getattr(candidate, "country", "") or ""
+        label = getattr(candidate, "label", "") or candidate.url
+        exit_ip = getattr(candidate, "exit_ip", "") or ""
+        latency = float(getattr(candidate, "latency_ms", 0.0) or 0.0)
+        where = f"{exit_ip} {country}".strip()
+        logger.info("Automatic proxy in use: %s (%.0f ms, exit %s)",
+                    label, latency, where or "?")
+        self.auto_proxy_found.emit(label, label, latency, exit_ip)
+        self.auto_proxy_status.emit(
+            f"Using {label} — {latency:.0f} ms, exit {where or 'unknown'}"
+        )
+        self.proxy_status_changed.emit(self.get_proxy_url(), True)
+
+    async def _auto_discovery_loop(self) -> None:
+        """Find a proxy, keep it alive, replace it when it stops answering."""
+        self._auto_task = asyncio.current_task()
+        while self._auto_discover:
+            candidate = await self.discover_proxy()
+            if not self._auto_discover:
+                break
+            if candidate is None:
+                await asyncio.sleep(60.0)
+                continue
+            # Re-check the proxy while it is in use: free ones die within
+            # minutes, and silently downloading through a dead proxy is worse
+            # than finding a new one.
+            while self._auto_discover:
+                await asyncio.sleep(self._auto_recheck_interval)
+                if not self._auto_discover:
+                    return
+                result = await self.verify_connection()
+                if result.success:
+                    continue
+                logger.info("Automatic proxy died (%s) — searching again",
+                            result.error)
+                self.auto_proxy_status.emit(
+                    f"Proxy stopped answering ({result.error}) — searching again…"
+                )
+                break
+        logger.info("Automatic proxy loop stopped")
+
+    def auto_discovery_state(self) -> dict:
+        """Snapshot for persistence/UI: enabled + what was found."""
+        cand = self._auto_candidate
+        return {
+            "enabled": self._auto_discover,
+            "proxy": cand.to_dict() if cand is not None else None,
+        }
 
     def get_aiohttp_connector(self):
         """Create an aiohttp connector routed through the proxy."""
@@ -292,6 +434,9 @@ class ProxyManager(QObject):
             "tor_enabled": self._tor_enabled,
             "kill_switch_enabled": self._kill_switch_enabled,
             "kill_switch_interval": self._kill_switch_interval,
+            # Remembered so an automatic search is not silently forgotten on
+            # restart (the endpoint itself is re-discovered, not restored).
+            "auto_discover": self._auto_discover,
         }
 
     def from_dict(self, data: dict) -> None:
@@ -307,4 +452,7 @@ class ProxyManager(QObject):
         self._tor_enabled = data.get("tor_enabled", False)
         self._kill_switch_enabled = data.get("kill_switch_enabled", False)
         self._kill_switch_interval = data.get("kill_switch_interval", 15.0)
+        # Flag only: turning it on here would touch the asyncio loop from
+        # whatever thread restored the settings.
+        self._auto_discover = bool(data.get("auto_discover", False))
 

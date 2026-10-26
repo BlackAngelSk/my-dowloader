@@ -310,6 +310,34 @@ def main() -> None:
     # did before, so downloads stayed stalled until resumed by hand.
     proxy_mgr.kill_switch_cleared.connect(dm.resume_all_active_jobs)
 
+    # ── Automatic proxy discovery ────────────────────────────────
+    # The app finds a working proxy itself and routes everything through it.
+    def _persist_proxy(*_args) -> None:
+        store.save(proxy=proxy_mgr.to_dict())
+
+    anon.auto_proxy_toggle.connect(proxy_mgr.set_auto_discovery)
+    # Persist the on/off choice immediately, not only once a proxy was found
+    # (otherwise quitting during the first search forgot the setting).
+    anon.auto_proxy_toggle.connect(_persist_proxy)
+    # Signals go straight through to the page: both sides take (str,str,float,str)
+    # and the page's slots only touch widgets, which Qt queues to the GUI thread.
+    proxy_mgr.auto_proxy_found.connect(anon.auto_proxy_found_ready.emit)
+    proxy_mgr.auto_proxy_found.connect(_persist_proxy)
+    proxy_mgr.auto_proxy_status.connect(anon.auto_proxy_status_ready.emit)
+
+    async def _handle_find_proxy():
+        await proxy_mgr.discover_proxy()
+        _persist_proxy()
+
+    anon.auto_proxy_find_now.connect(lambda: schedule_async(_handle_find_proxy()))
+
+    # Restored from the config file: reflect it in the UI and start the search
+    # once the engine loop is up (doing it earlier would be dropped).
+    if proxy_mgr.auto_discovery_enabled:
+        anon.set_auto_enabled_state(True)
+        anon.update_auto_proxy_status("⏳ Searching for a working proxy…")
+        QTimer.singleShot(1500, lambda: proxy_mgr.set_auto_discovery(True))
+
     # ── Bandwidth Scheduler ─────────────────────────────────────
     from omnidownloader.core.scheduler import BandwidthScheduler
 

@@ -54,6 +54,7 @@ HIDDEN_IMPORTS = [
     "omnidownloader.services.config_store",
     "omnidownloader.services.ip_checker",
     "omnidownloader.services.plugin_loader",
+    "omnidownloader.services.proxy_finder",
     "omnidownloader.modules.http_downloader",
     "omnidownloader.modules.media_extractor",
     "omnidownloader.modules.image_scraper",
