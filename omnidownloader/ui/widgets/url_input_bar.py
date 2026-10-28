@@ -7,6 +7,8 @@ import re
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QWidget
 
+from omnidownloader.core.url_utils import normalize_url
+
 #: "https://… sha256:abc…" — an expected digest typed after the URL.
 CHECKSUM_RE = re.compile(r"\b(sha256|sha512|sha1|md5):([0-9a-fA-F]{32,128})\b")
 
@@ -91,5 +93,7 @@ class URLInputBar(QWidget):
         if match:
             checksum = f"{match.group(1).lower()}:{match.group(2).lower()}"
             raw = (raw[:match.start()] + " " + raw[match.end():]).strip()
-        url = raw.split()[0] if raw.split() else ""
+        # Browsers hide the scheme ("youtube.com/watch?v=…") and paste can bring
+        # zero-width characters along; repair both before the router sees them.
+        url = normalize_url(raw.split()[0]) if raw.split() else ""
         return url, checksum

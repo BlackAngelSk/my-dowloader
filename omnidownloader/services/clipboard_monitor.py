@@ -37,6 +37,20 @@ SUPPORTED_DOMAINS = {
 }
 
 
+#: Address bars show ``youtube.com/watch?v=…`` without a scheme, and Windows
+#: apps copy links that way all the time.  URL_RE above can never match those,
+#: so the toast never appeared for them.
+_BARE_HOST_RE = re.compile(
+    r"(?<![\w./:@-])(?:[A-Za-z0-9\-_]+\.)*"
+    r"(?:" + "|".join(
+        sorted({re.escape(d.removeprefix("www.")) for d in SUPPORTED_DOMAINS},
+               key=len, reverse=True)
+    ) + r")"
+    r"(?::\d{1,5})?(?:[/?#][^\s<>\"']*)?",
+    re.IGNORECASE,
+)
+
+
 class ClipboardMonitor(QWidget):
     """Polls clipboard at regular intervals and emits detected URLs."""
 
@@ -70,11 +84,29 @@ class ClipboardMonitor(QWidget):
             return
         self._last_clipboard = text
 
-        for match in URL_RE.finditer(text):
+        url = self.first_downloadable(text)
+        if url:
+            self.url_detected.emit(url)
+
+    @classmethod
+    def first_downloadable(cls, text: str) -> str:
+        """First downloadable URL in *text*, normalised, or ``""``.
+
+        Tries scheme-carrying links first, then bare hosts ("youtube.com/…"
+        copied from an address bar), which are repaired with ``https://``.
+        """
+        from omnidownloader.core.url_utils import normalize_url
+
+        for match in URL_RE.finditer(text or ""):
             url = match.group(0)
-            if self._is_downloadable(url):
-                self.url_detected.emit(url)
-                break  # one at a time
+            if cls._is_downloadable(url):
+                return normalize_url(url)
+
+        for match in _BARE_HOST_RE.finditer(text or ""):
+            url = normalize_url(match.group(0))
+            if cls._is_downloadable(url):
+                return url
+        return ""
 
     @staticmethod
     def _is_downloadable(url: str) -> bool:

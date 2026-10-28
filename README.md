@@ -136,6 +136,13 @@ the job (✕) deletes both. Cancelling a job deliberately discards it.
 # paste into the URL bar:   https://example.com/big.iso sha256:<hex>
 ```
 
+Pasted links are tidied before routing: the `https://` part is optional
+(`youtube.com/watch?v=…` works, which is what the address bar and the Windows
+clipboard usually contain), zero-width characters from a paste are dropped, and
+a link that genuinely cannot be downloaded now says *why* (unsupported scheme,
+not a link at all, or yt-dlp still being installed) instead of one blanket
+message.
+
 ## Adding Custom Modules
 
 Drop a `.py` file into `~/.omnidownloader/plugins/` (the directory is created on

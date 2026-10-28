@@ -284,6 +284,22 @@ class MediaExtractor(BaseDownloaderModule):
             return False
 
     @staticmethod
+    def ytdlp_available(ytdlp_path: str = "yt-dlp") -> bool:
+        """True when *ytdlp_path* resolves to something runnable.
+
+        15 s probe timeouts and "not installed yet" used to reach the user as
+        "yt-dlp does not support it", which is a different (and false) claim.
+        """
+        if not ytdlp_path:
+            return False
+        try:
+            if Path(ytdlp_path).exists():
+                return True
+        except (OSError, ValueError):
+            pass
+        return bool(shutil.which(ytdlp_path))
+
+    @staticmethod
     async def probe_url(url: str, ytdlp_path: str = "yt-dlp") -> bool:
         """Quick probe: return True if yt-dlp can handle *url*.
 
@@ -292,14 +308,14 @@ class MediaExtractor(BaseDownloaderModule):
         If yt-dlp is not found, attempts auto-download first.
         """
         # If yt-dlp not found, try to auto-download
-        if not Path(ytdlp_path).exists() and not shutil.which(ytdlp_path):
+        if not MediaExtractor.ytdlp_available(ytdlp_path):
             try:
                 dm = DependencyManager()
                 ytdlp_path = await dm.ensure_ytdlp()
             except Exception:
                 logger.warning("Could not auto-download yt-dlp for probe")
                 return False
-        if not shutil.which(ytdlp_path) and not Path(ytdlp_path).exists():
+        if not MediaExtractor.ytdlp_available(ytdlp_path):
             return False
         try:
             cmd = [ytdlp_path, "--simulate", "--no-download",

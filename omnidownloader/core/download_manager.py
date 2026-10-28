@@ -18,6 +18,7 @@ from omnidownloader.core.models import (
 )
 from omnidownloader.core.bandwidth_limiter import BandwidthManager
 from omnidownloader.core.disk_utils import cleanup_partial_file
+from omnidownloader.core.url_utils import KNOWN_SCHEMES, normalize_url, url_scheme
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +103,11 @@ class DownloadManager(QObject):
 
     def enqueue(self, url: str, module_hint=None, download_path=None,
                 priority=Priority.NORMAL, sequential=False, **kwargs):
+        # Repair the shapes users actually paste (bare "youtube.com/...", links
+        # wrapped in invisible characters).  Without this the router saw no
+        # scheme and answered "no module can handle this URL" on Windows, where
+        # the address bar hides https://.
+        url = normalize_url(url)
         job = DownloadJob(url=url, priority=priority, sequential=sequential)
         if module_hint and module_hint != DownloadModule.UNKNOWN:
             job.module = module_hint
@@ -518,19 +524,60 @@ class DownloadManager(QObject):
                 return mod
             if mod is None:
                 job.state = DownloadState.FAILED
-                job.error_message = (
-                    "No module can handle this URL and yt-dlp does not support it."
-                )
+                job.error_message = self.unhandleable_reason(job.url, media)
                 self.job_state_changed.emit(job.id, job.state.value)
                 return None
             logger.info("yt-dlp cannot handle %s — using the HTTP downloader", job.url)
 
         if mod is None:
             job.state = DownloadState.FAILED
-            job.error_message = "No module can handle this URL."
+            job.error_message = self.unhandleable_reason(job.url, media)
             self.job_state_changed.emit(job.id, job.state.value)
             return None
         return mod
+
+    @staticmethod
+    def unhandleable_reason(url: str, media=None) -> str:
+        """Explain *why* nothing can download *url*.
+
+        One blanket sentence used to cover four different situations, and the
+        most common one on Windows — a bare ``youtube.com/watch?v=…`` with no
+        scheme, or a link nobody claims while yt-dlp is still downloading — was
+        reported as "yt-dlp does not support it", which is simply false and
+        leaves the user no way forward.
+        """
+        scheme = url_scheme(url)
+        if scheme and scheme not in KNOWN_SCHEMES:
+            return (
+                f"Unsupported link type '{scheme}:' — OmniDownloader downloads "
+                "http(s) links, media pages (via yt-dlp), magnet/.torrent links "
+                "and image pages."
+            )
+        if not scheme:
+            return (
+                "That does not look like a link: it has no http(s):// scheme and "
+                "no host name. Paste the full address from the address bar."
+            )
+        root = Path(url.split("?")[0]).suffix.lower()
+        if root in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+            return (
+                "This looks like an image link but no image module could load "
+                "it — the extension may be wrong or the server refused the request."
+            )
+        from omnidownloader.modules.media_extractor import MediaExtractor
+
+        ytdlp = getattr(media, "_ytdlp", "yt-dlp")
+        if not MediaExtractor.ytdlp_available(ytdlp):
+            return (
+                "yt-dlp is not available yet, so this link could not be checked. "
+                "Dependency download runs in the background after startup — wait "
+                "a moment and retry, or install it from Settings → Dependencies."
+            )
+        return (
+            "No module can handle this URL and yt-dlp does not support it. "
+            "yt-dlp is installed and was run against this link — if it is a "
+            "page in a browser, try the direct file or media URL instead."
+        )
 
     @staticmethod
     def _looks_like_webpage(meta: dict) -> bool:
