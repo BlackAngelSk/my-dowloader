@@ -97,6 +97,10 @@ python -m omnidownloader            # run the app
 python -m omnidownloader --diagnose # verify this machine can download
 ```
 
+On Windows you can skip the manual steps: `start.bat` creates `.venv`, installs
+`requirements.txt`, re-installs it whenever that file changes (or `pip` is missing),
+and then launches the app — a plain clone plus a double click is enough.
+
 Optional tools per platform:
 
 ```
