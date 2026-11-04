@@ -60,6 +60,17 @@ if "%NEED_INSTALL%"=="1" (
     echo Dependencies installed.
 )
 
+REM --- managed tools: yt-dlp, ffmpeg and aria2c ---------------------------
+REM The app can fetch these itself, but only in the background after the window
+REM opens, so the first links on a fresh install fail. Install them here first;
+REM already-present tools are detected without any network access.
+echo Checking bundled tools ^(yt-dlp, ffmpeg, aria2c^)...
+"%VPY%" -m omnidownloader --install-deps --quiet
+if errorlevel 1 (
+    echo [WARN] Some tools could not be downloaded. The app will retry in the
+    echo        background ^- media and torrent links may fail until it succeeds.
+)
+
 REM --- launch --------------------------------------------------------------
 "%VPY%" -m omnidownloader %*
 if errorlevel 1 pause

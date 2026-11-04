@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import platform
+import re
 import shutil
 import stat
+import subprocess
 from pathlib import Path
 from typing import Optional
 
@@ -34,6 +37,20 @@ _YTDLP_URLS = {
     ("Windows", "arm64"): "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe",
 }
 _YTDLP_FALLBACK = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+
+#: aria2c is the BitTorrent backend.  Only Windows ships an official portable
+#: build (a zip of a single aria2c.exe); Linux and macOS install it from the
+#: package manager, which is what ``install_hint("aria2c")`` says.  Without a
+#: Windows build the torrent/magnet module is dead on arrival on Windows, so the
+#: installer fetches it like ffmpeg.
+ARIA2_RELEASES_API = "https://api.github.com/repos/aria2/aria2/releases/latest"
+#: Fallback when the GitHub API is rate-limited or unreachable.  Pinned on
+#: purpose: asset names on aria2's releases are versioned, not "latest".
+ARIA2_PINNED_URL = (
+    "https://github.com/aria2/aria2/releases/download/"
+    "release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"
+)
+ARIA2_WIN_ASSET_RE = re.compile(r"win-64bit.*\.zip$", re.IGNORECASE)
 
 #: ffmpeg archives, per platform.  Values are lists of ``(url, archive_kind,
 #: binaries)``: macOS ships ffmpeg and ffprobe as *separate* zip files, Linux
@@ -94,14 +111,19 @@ class DependencyManager:
         return self.find_ffmpeg_binary()
 
     async def ensure_all(self) -> dict[str, str]:
-        """Download both yt-dlp and ffmpeg if missing.
+        """Download every managed tool that is missing.
 
-        Returns a dict mapping ``"yt-dlp"`` / ``"ffmpeg"`` to their final
-        paths.  Errors for individual tools are logged but do not prevent
-        the other from being downloaded.
+        Returns a dict mapping ``"yt-dlp"`` / ``"ffmpeg"`` (and ``"aria2c"`` on
+        Windows, where torrents have no other backend) to their final paths.
+        Errors for individual tools are logged but do not prevent the other
+        from being downloaded.
         """
+        wanted = [("yt-dlp", self.ensure_ytdlp), ("ffmpeg", self.ensure_ffmpeg)]
+        if self._system == platform_utils.WINDOWS:
+            wanted.append(("aria2c", self.ensure_aria2c))
+
         paths: dict[str, str] = {}
-        for name, coro in [("yt-dlp", self.ensure_ytdlp), ("ffmpeg", self.ensure_ffmpeg)]:
+        for name, coro in wanted:
             try:
                 paths[name] = await coro()
             except Exception:
@@ -114,6 +136,17 @@ class DependencyManager:
         ``force=True`` re-downloads even when a valid binary exists — used by
         the auto-updater, since YouTube breaks old extractors regularly.
         """
+        if not force:
+            # A yt-dlp provided by pip/pacman/Homebrew is usually a small
+            # launcher *script*, which _is_real_binary() rightly calls "not a
+            # binary".  It is still perfectly usable, and the old code tried to
+            # delete it — on a system install that raises PermissionError
+            # (/usr/bin/yt-dlp) and left the app with no yt-dlp at all.
+            system = shutil.which("yt-dlp")
+            if system and self._runs(system):
+                logger.info("Using the system yt-dlp at %s", system)
+                return system
+
         existing = Path(self.ytdlp_path)
         # Validate, don't just check existence: a truncated download or an
         # error page saved as "yt-dlp" used to be trusted forever.
@@ -121,8 +154,16 @@ class DependencyManager:
             logger.info("yt-dlp found at %s", self.ytdlp_path)
             return self.ytdlp_path
         if existing.exists() and existing.is_file() and not force:
-            logger.warning("Replacing invalid yt-dlp binary at %s", existing)
-            existing.unlink(missing_ok=True)
+            if self._owns(existing):
+                logger.warning("Replacing invalid yt-dlp binary at %s", existing)
+                existing.unlink(missing_ok=True)
+            else:
+                # Never delete a file the app did not put there (a system
+                # yt-dlp that fails to run, for instance).  Downloading our own
+                # copy into deps/ still fixes the app: ytdlp_path prefers it.
+                logger.warning(
+                    "Ignoring unusable yt-dlp at %s (not managed by the app) — "
+                    "downloading a private copy instead", existing)
 
         url = self._ytdlp_url()
         logger.info("Downloading yt-dlp for %s %s…", self._system, platform_utils.arch())
@@ -144,6 +185,34 @@ class DependencyManager:
             or _YTDLP_URLS.get((self._system, "x86_64"))
             or _YTDLP_FALLBACK
         )
+
+    def _owns(self, path: Path) -> bool:
+        """True when *path* is a file this app downloaded (inside deps/)."""
+        try:
+            path.resolve().relative_to(self._deps_dir.resolve())
+            return True
+        except (ValueError, OSError):
+            return False
+
+    def _runs(self, path: str) -> bool:
+        """True when *path* actually executes and prints a version.
+
+        A pip/pacman/Homebrew yt-dlp is a small launcher script, not a
+        PyInstaller binary, so "is it an executable file" is the wrong question
+        — running ``--version`` is the only reliable check (and it catches a
+        half-written download too).
+        """
+        if not path or not Path(path).exists():
+            return False
+        try:
+            proc = subprocess.run(
+                [path, "--version"],
+                capture_output=True, timeout=40,
+                **platform_utils.subprocess_kwargs(),
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return proc.returncode == 0 and bool(proc.stdout.strip())
 
     def _binary_name(self, tool: str) -> str:
         return f"{tool}.exe" if self._system == platform_utils.WINDOWS else tool
@@ -335,6 +404,143 @@ class DependencyManager:
                 return str(direct)
         return ""
 
+    # ── aria2c (torrent backend) ────────────────────────────────
+
+    @property
+    def aria2c_path(self) -> str:
+        """A usable aria2c path, or ``""``.
+
+        Order: the managed copy in ``deps/`` (downloaded here), then whatever
+        the system provides (PATH / ``OMNI_ARIA2C_PATH``).
+        """
+        name = self._binary_name("aria2c")
+        direct = self._deps_dir / name
+        if self._is_real_binary(direct):
+            return str(direct)
+        if self._deps_dir.is_dir():
+            for found in self._deps_dir.rglob(name):
+                if self._is_real_binary(found):
+                    return str(found)
+        return platform_utils.find_aria2c()
+
+    async def ensure_aria2c(self) -> str:
+        """Make aria2c available, downloading the portable Windows build.
+
+        aria2c is the only torrent backend on Windows (there is no libtorrent
+        wheel for it here), so without this the magnet/torrent module refuses
+        every job.  Linux and macOS take it from the package manager — the
+        error below carries the right command.
+        """
+        found = self.aria2c_path
+        if found:
+            logger.info("aria2c found at %s", found)
+            return found
+
+        if self._system != platform_utils.WINDOWS:
+            raise OSError(
+                "aria2c is not downloaded on this platform — "
+                + platform_utils.install_hint("aria2c")
+            )
+
+        url = await self._aria2_asset_url()
+        logger.info("Downloading aria2c for %s…", self._system)
+        archive = self._deps_dir / "aria2-dl.zip"
+        try:
+            await self._download_file(url, archive)
+            self._extract_named(archive, ("aria2c.exe",))
+        finally:
+            archive.unlink(missing_ok=True)
+
+        found = self.aria2c_path
+        if not found:
+            raise OSError(
+                f"The aria2c archive from {url} did not contain a usable "
+                "aria2c.exe"
+            )
+        logger.info("aria2c installed at %s", found)
+        return found
+
+    async def _aria2_asset_url(self) -> str:
+        """Newest Windows portable aria2c zip, or the pinned URL.
+
+        GitHub's API is unauthenticated here and rate-limits freely, so a
+        failure must not stop the install — the pinned release is still a
+        working aria2c.
+        """
+        try:
+            timeout = aiohttp.ClientTimeout(total=20, connect=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    ARIA2_RELEASES_API,
+                    headers={"Accept": "application/vnd.github+json"},
+                ) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"HTTP {resp.status}")
+                    data = json.loads(await resp.text())
+            assets = data.get("assets") or []
+            for asset in assets:
+                name = str(asset.get("name", ""))
+                if ARIA2_WIN_ASSET_RE.search(name):
+                    return str(asset["browser_download_url"])
+            raise RuntimeError("no win-64bit asset in the latest release")
+        except Exception as exc:  # noqa: BLE001
+            logger.info("Falling back to the pinned aria2c release (%s)", exc)
+            return ARIA2_PINNED_URL
+
+    def _extract_named(self, archive: Path, binaries: tuple[str, ...]) -> list[str]:
+        """Unpack *binaries* out of *archive* into the deps dir (flattened).
+
+        Zip-slip safe: only the base name is used as the target path, so a
+        hostile ``../../x`` member cannot escape the deps directory.
+        """
+        wanted = set(binaries) | {
+            b.replace(".exe", "") for b in binaries
+        } | {
+            f"{b}.exe" for b in binaries if not b.endswith(".exe")
+        }
+        extracted: list[str] = []
+
+        def _write(reader, target: Path) -> None:
+            with reader, open(target, "wb") as out:
+                shutil.copyfileobj(reader, out)
+            platform_utils.make_executable(target)
+            extracted.append(target.name)
+
+        if archive.suffix.lower() == ".zip":
+            import zipfile
+
+            with zipfile.ZipFile(archive) as zf:
+                for member in zf.namelist():
+                    name = Path(member).name
+                    if member.endswith("/") or name not in wanted:
+                        continue
+                    _write(zf.open(member), self._deps_dir / name)
+        else:
+            import tarfile
+
+            with tarfile.open(archive, "r:*") as tf:
+                for member in tf.getmembers():
+                    name = Path(member.name).name
+                    if not member.isfile() or name not in wanted:
+                        continue
+                    stream = tf.extractfile(member)
+                    if stream is not None:
+                        _write(stream, self._deps_dir / name)
+
+        missing = [
+            b for b in binaries
+            if b not in extracted and f"{b}.exe" not in extracted
+        ]
+        if missing:
+            raise RuntimeError(
+                f"{archive.name} did not contain {', '.join(missing)}"
+            )
+        return extracted
+
+    def optional_status(self) -> dict[str, bool]:
+        """Per-tool availability for tools that are not required on every OS."""
+        return {"aria2c": bool(self.aria2c_path)}
+
     def _make_executable(self, path: Path) -> None:
         platform_utils.make_executable(path)
 
@@ -468,13 +674,20 @@ class DependencyManager:
             + "; update it with your package manager or pip"
         )
 
+    def ytdlp_available(self) -> bool:
+        """True when *some* usable yt-dlp exists (managed or system).
+
+        One definition, used by both ``ensure_ytdlp`` and ``check_all``: they
+        used to disagree, so a failing install still reported "yt-dlp ok" and
+        the launcher printed "All dependencies are ready" next to a FAILED line.
+        """
+        if self._is_real_binary(self._deps_dir / self._binary_name("yt-dlp")):
+            return True
+        system = shutil.which("yt-dlp")
+        return bool(system and self._runs(system))
+
     def check_all(self) -> dict[str, bool]:
-        ytdlp = self.ytdlp_path
-        ytdlp_ok = (
-            (Path(ytdlp).is_file() and self._is_real_binary(Path(ytdlp)))
-            or shutil.which("yt-dlp") is not None
-        )
         return {
-            "yt-dlp": ytdlp_ok,
+            "yt-dlp": self.ytdlp_available(),
             "ffmpeg": bool(self.find_ffmpeg_binary()),
         }

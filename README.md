@@ -97,9 +97,18 @@ python -m omnidownloader            # run the app
 python -m omnidownloader --diagnose # verify this machine can download
 ```
 
-On Windows you can skip the manual steps: `start.bat` creates `.venv`, installs
-`requirements.txt`, re-installs it whenever that file changes (or `pip` is missing),
-and then launches the app — a plain clone plus a double click is enough.
+On Windows you can skip all of the manual steps: `start.bat` creates `.venv`,
+installs `requirements.txt`, re-installs it whenever that file changes (or `pip`
+is missing), installs the managed tools (`yt-dlp`, `ffmpeg`, and `aria2c` for
+torrents) and then launches the app — a plain clone plus a double click is
+enough. `run.sh` does the same on Linux/macOS.
+
+The tool installer is also available on its own:
+
+```bash
+python -m omnidownloader --install-deps          # install yt-dlp/ffmpeg (+ aria2c on Windows)
+python -m omnidownloader --install-deps --check  # report only, download nothing
+```
 
 Optional tools per platform:
 

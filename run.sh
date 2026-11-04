@@ -15,4 +15,10 @@ if [ ! -d "$VENV_DIR" ]; then
     echo "Dependencies installed."
 fi
 
+# yt-dlp / ffmpeg are managed by the app itself, but it only installs them in
+# the background after the window opens — do it up front so the first download
+# works.  Non-fatal: the GUI retries on its own.
+"$VENV_DIR/bin/python" -m omnidownloader --install-deps --quiet || \
+    echo "warning: could not install yt-dlp/ffmpeg — the app will retry in the background"
+
 exec "$VENV_DIR/bin/python" -m omnidownloader "$@"

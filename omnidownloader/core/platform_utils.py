@@ -378,10 +378,21 @@ def find_tor_binary() -> str:
 
 
 def find_aria2c() -> str:
-    """Locate aria2c (the torrent backend fallback)."""
+    """Locate aria2c (the torrent backend).
+
+    Order: ``OMNI_ARIA2C_PATH``, the app-managed copy in ``deps/`` (the Windows
+    installer downloads a portable build there), then ``PATH``.
+    """
     override = os.environ.get("OMNI_ARIA2C_PATH", "").strip()
     if override and Path(override).is_file():
         return override
+    name = "aria2c.exe" if system() == WINDOWS else "aria2c"
+    managed = deps_dir() / name
+    try:
+        if managed.is_file() and managed.stat().st_size > 1024:
+            return str(managed)
+    except OSError:
+        pass
     return shutil.which("aria2c") or ""
 
 

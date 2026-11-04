@@ -80,6 +80,17 @@ def main() -> None:
         argv = [a for a in sys.argv[1:] if a != "--diagnose"]
         sys.exit(diagnostics_main(argv))
 
+    # `python -m omnidownloader --install-deps [--check] [--quiet]` installs the
+    # managed tools (yt-dlp, ffmpeg, aria2c on Windows) and exits — the GUI used
+    # to do this only in the background after startup, so the first links of a
+    # fresh install failed.  Deliberately before the Qt import: the launchers run
+    # this on every start and must not pay for GUI initialisation.
+    if "--install-deps" in sys.argv:
+        from omnidownloader.deps_cli import main as install_deps_main
+
+        argv = [a for a in sys.argv[1:] if a != "--install-deps"]
+        sys.exit(install_deps_main(argv))
+
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtCore import QTimer
 
