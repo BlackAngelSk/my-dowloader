@@ -145,6 +145,22 @@ the job (✕) deletes both. Cancelling a job deliberately discards it.
 # paste into the URL bar:   https://example.com/big.iso sha256:<hex>
 ```
 
+On every start the app asks GitHub for the latest release (Settings → Updates →
+"Update automatically on start", on by default). How it installs depends on how
+it runs:
+
+* **git checkout** (what `start.bat`/`run.sh` use): the checkout is
+  fast-forwarded with `git fetch` + `git pull --ff-only`, then the app restarts
+  through the launcher so changed requirements are installed. A dirty tree, a
+  detached HEAD, a non-tracking branch or diverged history are *not* touched —
+  the update is skipped and the app keeps running.
+* **packaged build** (installer/.dmg/tarball): the release asset for this
+  platform is downloaded and installed; on Windows the Inno installer runs
+  silently and the app exits so it can replace the binary.
+
+Turn it off in Settings → Updates; "Check for Updates" there still asks before
+installing anything.
+
 Pasted links are tidied before routing: the `https://` part is optional
 (`youtube.com/watch?v=…` works, which is what the address bar and the Windows
 clipboard usually contain), zero-width characters from a paste are dropped, and

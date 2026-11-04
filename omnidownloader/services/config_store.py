@@ -26,6 +26,8 @@ DEFAULTS: dict[str, Any] = {
     "speed_limit_kbs": "",
     "per_task_limit_kbs": "",
     "theme": "auto",
+    #: Check GitHub at startup and install a newer version without asking.
+    "auto_update": True,
     "proxy": {},
     "kill_switch_enabled": False,
     "kill_switch_interval": 15,

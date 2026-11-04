@@ -223,6 +223,22 @@ class UpdateDownloader(QThread):
         return str(filepath)
 
 
+class SourceUpdateWorker(QThread):
+    """Fast-forwards a git checkout in the background (never blocks the UI)."""
+
+    done = pyqtSignal(str, str)     # status, message
+
+    def run(self):
+        from omnidownloader.services import source_updater
+
+        try:
+            result = source_updater.update()
+            self.done.emit(result.status, result.message)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Source update failed: %s", exc)
+            self.done.emit("failed", str(exc))
+
+
 class UpdateService(QObject):
     """Central update coordinator — checks, downloads, and installs updates.
 
@@ -231,28 +247,87 @@ class UpdateService(QObject):
         svc = UpdateService(version, parent=window)
         svc.update_available.connect(my_dialog.show_update)
         svc.check_for_updates()
+
+    With ``auto_update=True`` a startup check does not raise a dialog: a git
+    checkout is fast-forwarded, a frozen build downloads and installs its
+    release asset, and ``auto_update_finished`` reports what happened.
     """
     update_available = pyqtSignal(object)
     check_failed = pyqtSignal(str)
     up_to_date = pyqtSignal()
     download_progress = pyqtSignal(int, str)
     download_finished = pyqtSignal(str)
+    #: Auto mode: (status, human message) — status is updated / up-to-date /
+    #: skipped / failed / installing.
+    auto_update_finished = pyqtSignal(str, str)
+    #: Auto mode: a newer release exists and is being downloaded/installed.
+    auto_update_started = pyqtSignal(object)
 
-    def __init__(self, current_version: str, proxy_url: str = "", parent=None):
+    def __init__(self, current_version: str, proxy_url: str = "",
+                 parent=None, auto_update: bool = False):
         super().__init__(parent)
         self._version = current_version
         self._proxy_url = proxy_url
         self._checker: Optional[UpdateChecker] = None
         self._downloader: Optional[UpdateDownloader] = None
+        self._source_worker: Optional[SourceUpdateWorker] = None
+        self._auto_update = bool(auto_update)
+        self._auto_requested = False
+        self._auto_install_pending = False
 
-    def check_for_updates(self) -> None:
+    @property
+    def auto_update_enabled(self) -> bool:
+        return self._auto_update
+
+    def set_auto_update(self, enabled: bool) -> None:
+        """Turn startup auto-updates on/off (persisted by the settings UI)."""
+        self._auto_update = bool(enabled)
+
+    def check_for_updates(self, auto: bool = False) -> None:
+        """Check GitHub for a newer release.
+
+        *auto* is set by the startup call: when auto-updates are enabled the
+        update is installed instead of prompting.
+        """
         if self._checker and self._checker.isRunning():
             return
+        self._auto_requested = bool(auto)
         self._checker = UpdateChecker(self._version, self._proxy_url, parent=self)
-        self._checker.update_found.connect(self.update_available.emit)
+        self._checker.update_found.connect(self._on_update_found)
         self._checker.check_failed.connect(self.check_failed.emit)
         self._checker.up_to_date.connect(self.up_to_date.emit)
         self._checker.start()
+
+    def _on_update_found(self, info: UpdateInfo) -> None:
+        if not (self._auto_requested and self._auto_update):
+            self.update_available.emit(info)
+            return
+        self.auto_update_started.emit(info)
+        self._run_auto_update(info)
+
+    def _run_auto_update(self, info: UpdateInfo) -> None:
+        """Install *info* without asking.
+
+        A git checkout fast-forwards itself; a frozen build downloads the
+        platform asset and runs the installer.
+        """
+        from omnidownloader.services import source_updater
+
+        if source_updater.is_source_checkout() and source_updater.git_available():
+            logger.info("Auto-update: fast-forwarding the git checkout")
+            self._source_worker = SourceUpdateWorker(parent=self)
+            self._source_worker.done.connect(self._on_source_update_done)
+            self._source_worker.start()
+            return
+
+        self._auto_install_pending = True
+        logger.info("Auto-update: downloading %s", info.version)
+        self.download_update(info)
+
+    def _on_source_update_done(self, status: str, message: str) -> None:
+        logger.info("Auto-update (source): %s — %s", status, message)
+        self._source_worker = None
+        self.auto_update_finished.emit(status, message)
 
     def download_update(self, info: UpdateInfo) -> None:
         if self._downloader and self._downloader.isRunning():
@@ -262,9 +337,25 @@ class UpdateService(QObject):
         logger.info("Downloading update %s from %s", info.version, url)
         self._downloader = UpdateDownloader(url, dest, self._proxy_url, parent=self)
         self._downloader.progress.connect(self.download_progress.emit)
-        self._downloader.finished.connect(self.download_finished.emit)
+        self._downloader.finished.connect(self._on_download_finished)
         self._downloader.error.connect(lambda e: logger.error("Download error: %s", e))
+        self._downloader.error.connect(
+            lambda e: self.auto_update_finished.emit("failed", f"download failed: {e}")
+            if self._auto_install_pending else None
+        )
         self._downloader.start()
+
+    def _on_download_finished(self, path: str) -> None:
+        """Download complete: install silently in auto mode, or let the UI ask."""
+        self.download_finished.emit(path)
+        if not self._auto_install_pending:
+            return
+        self._auto_install_pending = False
+        logger.info("Auto-update: installing %s", path)
+        self.auto_update_finished.emit("installing", f"installing {Path(path).name}")
+        if not self.install_update(path):
+            self.auto_update_finished.emit(
+                "failed", "could not install the downloaded update — see the log")
 
     @staticmethod
     def install_update(file_path: str) -> bool:
@@ -390,18 +481,40 @@ class UpdateService(QObject):
             pass
 
     @staticmethod
-    def restart_app() -> None:
-        """Relaunch the application and exit the current process."""
-        args = [sys.executable]
-        if not getattr(sys, "frozen", False):
-            # Only a source checkout needs "-m omnidownloader"; the frozen
-            # bootloader does not implement -m, so passing it just started a
-            # second copy of the app while the old one kept running.
-            args += ["-m", "omnidownloader"]
+    def restart_app(via_launcher: bool = False) -> None:
+        """Relaunch the application and exit the current process.
+
+        *via_launcher* re-runs ``start.bat`` / ``run.sh`` instead of the
+        interpreter: after a git update the new commit may have changed
+        requirements.txt, and those installs must not happen in a running
+        process (on Windows the loaded DLLs are locked).  The launcher already
+        knows how to install them and then start the app.
+        """
+        command = None
+        cwd = None
+        if via_launcher:
+            from omnidownloader.services import source_updater
+
+            root = source_updater.repo_root()
+            launcher = source_updater.launcher_for(root) if root else None
+            if launcher is not None:
+                cwd = str(root)
+                command = (["cmd", "/c", str(launcher)]
+                           if platform_utils.is_windows()
+                           else ["bash", str(launcher)])
+
+        if command is None:
+            command = [sys.executable]
+            if not getattr(sys, "frozen", False):
+                # Only a source checkout needs "-m omnidownloader"; the frozen
+                # bootloader does not implement -m, so passing it just started a
+                # second copy of the app while the old one kept running.
+                command += ["-m", "omnidownloader"]
+
         try:
             # Detached from this process: on Windows the new copy must not be
             # in the same job object as the exiting one.
-            subprocess.Popen(args, cwd=None, **platform_utils.subprocess_kwargs())
+            subprocess.Popen(command, cwd=cwd, **platform_utils.subprocess_kwargs())
         except OSError as exc:
             logger.error("Failed to relaunch: %s", exc)
             return

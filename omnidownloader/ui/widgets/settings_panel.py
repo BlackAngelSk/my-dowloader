@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
-    QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
@@ -92,7 +92,18 @@ class SettingsPanel(QWidget):
         self._ytdlp_label.setObjectName("muted")
         update_layout.addWidget(self._ytdlp_label)
 
-        update_group.setLayout(update_layout)
+        update_form = QFormLayout()
+        # Silent startup update: a git checkout is fast-forwarded, a packaged
+        # build installs the release asset, then the app restarts itself.
+        self._auto_update_check = QCheckBox("Update automatically on start")
+        self._auto_update_check.setToolTip(
+            "Check GitHub when the app starts and install a newer version "
+            "without asking"
+        )
+        update_form.addRow(self._auto_update_check)
+        update_box = QVBoxLayout(update_group)
+        update_box.addLayout(update_layout)
+        update_box.addLayout(update_form)
         root.addWidget(update_group)
 
         # ── Buttons ──────────────────────────────────────────

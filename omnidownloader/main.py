@@ -220,6 +220,9 @@ def main() -> None:
     update_svc = UpdateService(
         current_version=app.applicationVersion(),
         parent=window,
+        # Startup auto-update: a git checkout fast-forwards itself, a packaged
+        # build installs the release asset.  Persisted, and off-able in Settings.
+        auto_update=bool(saved.get("auto_update", True)),
     )
 
     def _show_update_dialog(info):
@@ -234,9 +237,42 @@ def main() -> None:
         lambda: window.show_toast("OmniDownloader is up to date ✓")
     )
 
-    # Wire "Check for Updates" button in Settings page
+    def _on_auto_update_finished(status: str, message: str) -> None:
+        """Report a silent startup update, and restart into the new code."""
+        logger.info("Startup auto-update: %s — %s", status, message)
+        if status == "updated":
+            window.show_toast(f"Updated OmniDownloader — {message}. Restarting…")
+            # Give the toast a moment, then hand over to the launcher, which
+            # installs any new requirements before starting the new code.
+            QTimer.singleShot(
+                1500, lambda: UpdateService.restart_app(via_launcher=True))
+            return
+        if status == "installing":
+            window.show_toast(f"Update {message}… the app will close to finish")
+            return
+        if status == "failed":
+            window.show_toast(f"Automatic update failed: {message}")
+            return
+        # "skipped" is normal when git is missing or the tree is dirty.
+        if status == "skipped" and message:
+            logger.info("Auto-update skipped: %s", message)
+
+    update_svc.auto_update_finished.connect(_on_auto_update_finished)
+    update_svc.auto_update_started.connect(
+        lambda info: window.show_toast(f"Updating OmniDownloader to {info.version}…")
+    )
+
+    # Wire "Check for Updates" button + the auto-update switch in Settings
     settings_panel = window._settings._panel
     settings_panel._check_update_btn.clicked.connect(update_svc.check_for_updates)
+    settings_panel._auto_update_check.setChecked(update_svc.auto_update_enabled)
+
+    def _on_auto_update_toggled(enabled: bool) -> None:
+        update_svc.set_auto_update(enabled)
+        store.save(auto_update=bool(enabled))
+        logger.info("Automatic updates on startup: %s", "on" if enabled else "off")
+
+    settings_panel._auto_update_check.toggled.connect(_on_auto_update_toggled)
 
     # ── yt-dlp freshness ────────────────────────────────────────
     async def _update_ytdlp(force: bool = False):
@@ -265,9 +301,10 @@ def main() -> None:
     )
     QTimer.singleShot(4000, lambda: schedule_async(_update_ytdlp()))
 
-    # Non-blocking auto-check on startup (2s delay so UI renders first)
+    # Non-blocking startup check (2s so the UI renders first).  auto=True means
+    # "install it if auto-updates are enabled", not "ask me".
     from PyQt6.QtCore import QTimer
-    QTimer.singleShot(2000, update_svc.check_for_updates)
+    QTimer.singleShot(2000, lambda: update_svc.check_for_updates(auto=True))
 
     # Wire anonymity page signals
     from omnidownloader.core.proxy_manager import ProxyConfig, ProxyType

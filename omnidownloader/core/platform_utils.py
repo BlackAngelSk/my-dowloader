@@ -419,6 +419,11 @@ def install_hint(tool: str) -> str:
             MACOS: "brew install aria2",
             LINUX: "sudo pacman -S aria2  (or: sudo apt install aria2)",
         },
+        "git": {
+            WINDOWS: "winget install Git.Git",
+            MACOS: "brew install git",
+            LINUX: "sudo pacman -S git  (or: sudo apt install git)",
+        },
         "libtorrent": {
             WINDOWS: "pip install libtorrent  (or use aria2c instead)",
             MACOS: "brew install libtorrent-rasterbar && pip install libtorrent",
