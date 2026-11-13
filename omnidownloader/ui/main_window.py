@@ -1,34 +1,39 @@
-"""Main application window — sidebar navigation + page stack + theming."""
+"""Main application window — navigation rail, page stack and theming."""
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QMainWindow, QPushButton,
+    QApplication, QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
     QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from omnidownloader.core import platform_utils
 from omnidownloader.core.download_manager import DownloadManager
-from omnidownloader.core.models import DownloadJob
-from omnidownloader.ui.themes import (
-    DARK_COLORS, LIGHT_COLORS, generate_stylesheet, get_system_theme,
-)
+from omnidownloader.ui import icons, themes
+from omnidownloader.ui.pages.anonymity_page import AnonymityPage
 from omnidownloader.ui.pages.dashboard_page import DashboardPage
 from omnidownloader.ui.pages.history_page import HistoryPage
-from omnidownloader.ui.pages.settings_page import SettingsPage
-from omnidownloader.ui.pages.anonymity_page import AnonymityPage
 from omnidownloader.ui.pages.scheduler_page import SchedulerPage
-from omnidownloader.ui.widgets.toast_notification import ToastNotification
-from omnidownloader.ui.widgets.media_player import MediaPreviewWidget
+from omnidownloader.ui.pages.settings_page import SettingsPage
 from omnidownloader.ui.widgets.format_dialog import FormatSelectionDialog
+from omnidownloader.ui.widgets.media_player import MediaPreviewWidget
+from omnidownloader.ui.widgets.toast_notification import ToastNotification
 from omnidownloader.ui.drag_drop_overlay import DragDropOverlay
 
 logger = logging.getLogger(__name__)
+
+#: (icon, label) per page, in stack order.
+NAV_ITEMS = (
+    ("download", "Downloads"),
+    ("history", "History"),
+    ("shield", "Anonymity"),
+    ("clock", "Scheduler"),
+    ("sliders", "Settings"),
+)
 
 
 class MainWindow(QMainWindow):
@@ -36,91 +41,123 @@ class MainWindow(QMainWindow):
     def __init__(self, download_manager: DownloadManager) -> None:
         super().__init__()
         self._dm = download_manager
-        self._theme = get_system_theme()
+        self._theme = themes.get_system_theme()
+        themes.set_current_mode(self._theme)
         self.setWindowTitle("OmniDownloader")
-        self.setMinimumSize(960, 640)
-        self.resize(1100, 720)
+        self.setMinimumSize(1000, 660)
+        self.resize(1180, 760)
         self.setAcceptDrops(True)
         self._build_ui()
         self._connect_signals()
         self._apply_theme()
 
+    # ── construction ────────────────────────────────────────────
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("appShell")
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # Sidebar
-        sidebar = QWidget()
-        sidebar.setObjectName("sidebar")
-        sb_layout = QVBoxLayout(sidebar)
-        sb_layout.setContentsMargins(12, 16, 12, 16)
-        sb_layout.setSpacing(4)
+        main_layout.addWidget(self._build_sidebar())
 
-        logo = QPushButton("\u26a1 OmniDownloader")
-        logo.setObjectName("title")
-        logo.setStyleSheet("font-size: 16px; font-weight: bold; border: none; text-align: left;")
-        logo.setEnabled(False)
-        sb_layout.addWidget(logo)
-        sb_layout.addSpacing(16)
-
-        self._nav_buttons: list[QPushButton] = []
-        btn_dashboard = QPushButton("\U0001f4e5  Dashboard")
-        btn_history = QPushButton("\U0001f4cb  History")
-        btn_anonymity = QPushButton("\U0001f6e1\ufe0f  Anonymity")
-        btn_scheduler = QPushButton("\U0001f552  Scheduler")
-        btn_settings = QPushButton("\u2699\ufe0f  Settings")
-        theme_toggle = QPushButton("\U0001f319  Dark Mode" if self._theme == "dark" else "\u2600\ufe0f  Light Mode")
-        theme_toggle.setObjectName("themeToggle")
-
-        for btn in (btn_dashboard, btn_history, btn_anonymity, btn_scheduler, btn_settings):
-            btn.setObjectName("navBtn")
-            self._nav_buttons.append(btn)
-            sb_layout.addWidget(btn)
-
-        sb_layout.addStretch()
-        sb_layout.addWidget(theme_toggle)
-        self._theme_btn = theme_toggle
-
-        main_layout.addWidget(sidebar)
-
-        # Page Stack
         self._pages = QStackedWidget()
         self._dashboard = DashboardPage()
         self._history = HistoryPage()
         self._anonymity = AnonymityPage()
         self._scheduler_page = SchedulerPage()
         self._settings = SettingsPage()
-
-        self._pages.addWidget(self._dashboard)
-        self._pages.addWidget(self._history)
-        self._pages.addWidget(self._anonymity)
-        self._pages.addWidget(self._scheduler_page)
-        self._pages.addWidget(self._settings)
+        for page in (self._dashboard, self._history, self._anonymity,
+                     self._scheduler_page, self._settings):
+            self._pages.addWidget(page)
         main_layout.addWidget(self._pages, 1)
 
-        # Drag-drop overlay
         self._overlay = DragDropOverlay(self)
-
-        # Toast notification
         self._toast = ToastNotification(self)
-
-        # Media preview player
         self._media_player = MediaPreviewWidget(self)
         self._media_player.hide()
 
-        # Nav button wiring
-        btn_dashboard.clicked.connect(lambda: self._switch_page(0))
-        btn_history.clicked.connect(lambda: self._switch_page(1))
-        btn_anonymity.clicked.connect(lambda: self._switch_page(2))
-        btn_scheduler.clicked.connect(lambda: self._switch_page(3))
-        btn_settings.clicked.connect(lambda: self._switch_page(4))
-        theme_toggle.clicked.connect(self._toggle_theme)
-
         self._switch_page(0)
 
+    def _build_sidebar(self) -> QWidget:
+        sidebar = QWidget()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(236)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(14, 18, 14, 14)
+        layout.setSpacing(4)
+
+        # ── brand ──────────────────────────────────────────────
+        brand = QWidget()
+        brand_layout = QHBoxLayout(brand)
+        brand_layout.setContentsMargins(4, 0, 4, 0)
+        brand_layout.setSpacing(10)
+        mark = QLabel()
+        mark.setPixmap(icons.pixmap("logo", themes.current_palette().accent, 34))
+        mark.setFixedSize(34, 34)
+        brand_layout.addWidget(mark)
+        names = QVBoxLayout()
+        names.setSpacing(0)
+        name = QLabel("OmniDownloader")
+        name.setObjectName("logoText")
+        sub = QLabel("download manager")
+        sub.setObjectName("logoSub")
+        names.addWidget(name)
+        names.addWidget(sub)
+        brand_layout.addLayout(names)
+        brand_layout.addStretch()
+        self._brand_mark = mark
+        layout.addWidget(brand)
+        layout.addSpacing(18)
+
+        section = QLabel("WORKSPACE")
+        section.setObjectName("navSection")
+        layout.addWidget(section)
+        layout.addSpacing(2)
+
+        # ── navigation ─────────────────────────────────────────
+        self._nav_buttons: list[QPushButton] = []
+        for index, (_glyph, label) in enumerate(NAV_ITEMS):
+            btn = QPushButton(f"  {label}")
+            btn.setObjectName("navBtn")
+            btn.setCheckable(False)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setMinimumHeight(38)
+            btn.setIconSize(QSize(18, 18))
+            btn.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+            btn.clicked.connect(lambda _checked=False, i=index: self._switch_page(i))
+            self._nav_buttons.append(btn)
+            layout.addWidget(btn)
+
+        layout.addStretch()
+
+        # ── footer: theme + version ────────────────────────────
+        divider = QFrame()
+        divider.setObjectName("divider")
+        divider.setFixedHeight(1)
+        layout.addWidget(divider)
+        layout.addSpacing(6)
+
+        self._theme_btn = QPushButton("  Light mode" if self._theme == "dark"
+                                      else "  Dark mode")
+        self._theme_btn.setObjectName("themeToggle")
+        self._theme_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._theme_btn.setMinimumHeight(36)
+        self._theme_btn.setIconSize(QSize(16, 16))
+        self._theme_btn.clicked.connect(self._toggle_theme)
+        layout.addWidget(self._theme_btn)
+
+        try:
+            from omnidownloader import __version__
+            version = __version__
+        except Exception:  # noqa: BLE001
+            version = "0.1.0"
+        self._version_label = QLabel(f"Version {version}")
+        self._version_label.setObjectName("sidebarFooter")
+        self._version_label.setContentsMargins(10, 4, 0, 0)
+        layout.addWidget(self._version_label)
+        return sidebar
 
     def _connect_signals(self) -> None:
         self._dm.job_added.connect(self._on_job_added)
@@ -146,17 +183,20 @@ class MainWindow(QMainWindow):
         # Scheduler rules are applied by main.py's _apply_scheduler_rules
         # against the scheduler instance; connecting them here as well applied
         # every rule edit twice.
-        # Media player
         self._media_player.closed.connect(self._on_media_player_closed)
-        # Format selection
         self._dm.format_selection_needed.connect(self._on_format_selection_needed)
 
+    # ── navigation / theme ──────────────────────────────────────
     def _switch_page(self, index: int) -> None:
         self._pages.setCurrentIndex(index)
+        palette = themes.current_palette()
         for i, btn in enumerate(self._nav_buttons):
-            btn.setProperty("active", i == index)
+            active = i == index
+            btn.setProperty("active", active)
+            glyph = NAV_ITEMS[i][0]
+            btn.setIcon(icons.icon(glyph, palette.accent if active else palette.text_2, 18))
             style = btn.style()
-            if style:
+            if style is not None:
                 style.unpolish(btn)
                 style.polish(btn)
 
@@ -169,15 +209,32 @@ class MainWindow(QMainWindow):
             return
         self._theme = theme
         self._apply_theme()
-        self._theme_btn.setText(
-            "\U0001f319  Dark Mode" if theme == "dark" else "\u2600\ufe0f  Light Mode"
-        )
 
     def _apply_theme(self) -> None:
-        self.setStyleSheet(generate_stylesheet(self._theme))
-        color = DARK_COLORS.accent if self._theme == "dark" else LIGHT_COLORS.accent
-        self._dashboard._speed_graph.set_accent_color(color)
+        themes.set_current_mode(self._theme)
+        palette = themes.current_palette()
+        app = QApplication.instance()
+        if app is not None:
+            app.setPalette(themes.qt_palette(self._theme))
+            app.setStyleSheet(themes.generate_stylesheet(self._theme))
+        self.setStyleSheet(themes.generate_stylesheet(self._theme))
 
+        self._dashboard._speed_graph.set_accent_color(palette.accent)
+        self._dashboard.restyle()
+        self._history.restyle()
+        self._toast.apply_theme()
+        self._brand_mark.setPixmap(icons.pixmap("logo", palette.accent, 34))
+        # The toggle shows what clicking it will do, not what is active.
+        if self._theme == "dark":
+            self._theme_btn.setText("  Light mode")
+            self._theme_btn.setIcon(icons.icon("sun", palette.text_2, 16))
+        else:
+            self._theme_btn.setText("  Dark mode")
+            self._theme_btn.setIcon(icons.icon("moon", palette.text_2, 16))
+        # Page-2 icons are drawn per state; re-run the active page selection.
+        self._switch_page(self._pages.currentIndex())
+
+    # ── slots ───────────────────────────────────────────────────
     def _on_url_submitted(self, url: str) -> None:
         self._dm.enqueue(url)
 
@@ -302,4 +359,3 @@ class MainWindow(QMainWindow):
                 "quality_label": "Best",
                 "audio_only": False,
             })
-

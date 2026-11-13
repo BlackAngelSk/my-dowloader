@@ -47,7 +47,8 @@ omnidownloader/
 │   ├── torrent_downloader.py  # libtorrent wrapper
 │   └── image_scraper.py       # Batch image scraper
 ├── ui/
-│   ├── themes.py              # Dark/Light QSS stylesheet engine
+│   ├── themes.py              # Palette + the whole QSS design system
+│   ├── icons.py               # Vector glyphs painted with QPainter
 │   ├── main_window.py         # Main application window
 │   ├── drag_drop_overlay.py   # Drag-and-drop overlay (URL lists)
 │   ├── widgets/
@@ -66,6 +67,28 @@ omnidownloader/
     ├── dependency_manager.py  # Auto-download/update yt-dlp, ffmpeg
     └── plugin_loader.py       # Dynamic module discovery
 ```
+
+## Interface
+
+One window, five pages in a 236 px rail (Downloads, History, Anonymity,
+Scheduler, Settings). Every colour lives in `ui/themes.py` (graphite dark and
+paper light) and every glyph is painted by `ui/icons.py` — no emoji, no image
+assets, and both themes restyle widgets that used to paint their own colours.
+
+The Downloads page reads top to bottom as one flow: the title with live counts
+and three metric chips (throughput, active, queued), the command bar
+(`https://` optional, paste or drop), a throughput card with a sparkline, filter
+chips (All / Active / Paused / Finished), then one card per transfer. A card
+shows a file-type tile, name, host and folder, a state pill, the action icons,
+a progress bar with the percentage, and a meta line with speed · size · ETA plus
+its queue priority.
+
+```
+QT_QPA_PLATFORM=offscreen .venv/bin/python tools/shots_ui.py --out /tmp/shots --theme both
+```
+
+renders every page (and the clipboard toast) to PNG from the real widgets, which
+is how the design was reviewed — no mock-up drift.
 
 ## Requirements
 
@@ -230,6 +253,7 @@ Note that built-ins are *imported*, so packaging them into a frozen bundle (see
 ```bash
 .venv/bin/python tools/test_routing.py            # URL → module routing
 .venv/bin/python tools/test_http_downloader.py    # segmented engine, resume, checksums
+.venv/bin/python tools/test_ui_theme.py           # design system: theme, icons, cards, filters
 .venv/bin/python tools/test_segment_planner.py    # piece grid + work stealing (pure)
 .venv/bin/python tools/test_segmented_engine.py   # stall re-split, retries, changed file
 .venv/bin/python tools/bench_segmented.py         # pool vs single connection, byte-exact

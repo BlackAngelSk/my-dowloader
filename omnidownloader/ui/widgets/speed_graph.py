@@ -13,11 +13,12 @@ class SpeedGraph(QWidget):
 
     MAX_POINTS = 120  # 2 minutes at 1 Hz
 
-    def __init__(self, parent: QWidget | None = None, accent_color: str = "#3B82F6") -> None:
+    def __init__(self, parent: QWidget | None = None, accent_color: str = "") -> None:
         super().__init__(parent)
         self._data: deque[float] = deque(maxlen=self.MAX_POINTS)
         self._max_speed: float = 1.0
-        self._accent = QColor(accent_color)
+        from omnidownloader.ui import themes
+        self._accent = QColor(accent_color or themes.current_palette().accent)
         self.setMinimumHeight(120)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -32,9 +33,6 @@ class SpeedGraph(QWidget):
         self._accent = QColor(color)
 
     def paintEvent(self, a0) -> None:
-        if not self._data:
-            return
-
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -55,21 +53,29 @@ class SpeedGraph(QWidget):
         points = list(self._data)
         n = len(points)
         if n < 2:
+            # Nothing to plot yet: a flat line on the axis reads as "idle",
+            # an empty rectangle reads as "broken".
+            baseline = h - padding
+            painter.setPen(QPen(QColor(100, 100, 100, 40), 1))
+            painter.drawLine(padding, baseline, w - padding, baseline)
             painter.end()
             return
 
         step = (w - 2 * padding) / max(1, self.MAX_POINTS - 1)
+        # Newest sample sits on the right edge and history grows leftwards, so
+        # a young session does not draw a tiny graph in the left corner.
+        x0 = padding + max(0, (self.MAX_POINTS - n)) * step
         max_val = max(self._max_speed, 1.0)
 
         # Filled area
         from PyQt6.QtGui import QPolygonF
         from PyQt6.QtCore import QPointF
-        poly = [QPointF(padding, h)]
+        poly = [QPointF(x0, h)]
         for i, val in enumerate(points):
-            x = padding + i * step
+            x = x0 + i * step
             y = h - (val / max_val) * (h - 2 * padding)
             poly.append(QPointF(x, y))
-        poly.append(QPointF(padding + (n - 1) * step, h))
+        poly.append(QPointF(x0 + (n - 1) * step, h))
 
         fill_color = QColor(self._accent)
         fill_color.setAlpha(40)
@@ -82,7 +88,7 @@ class SpeedGraph(QWidget):
         painter.setBrush(Qt.BrushStyle.NoBrush)
         path_poly = []
         for i, val in enumerate(points):
-            x = padding + i * step
+            x = x0 + i * step
             y = h - (val / max_val) * (h - 2 * padding)
             path_poly.append(QPointF(x, y))
         painter.drawPolyline(QPolygonF(path_poly))

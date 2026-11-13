@@ -32,13 +32,10 @@ class DragDropOverlay(QWidget):
         self.hide()
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         layout = QVBoxLayout(self)
-        label = QLabel("\U0001f4c2\nDrop files, .torrent, URL lists, or URLs here")
+        label = QLabel("Drop files, .torrent, URL lists or links here")
+        label.setObjectName("dropZone")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        label.setStyleSheet(
-            "font-size: 20px; font-weight: bold; color: #F1F5F9;"
-            "background: rgba(15, 23, 42, 0.85); border: 3px dashed #3B82F6;"
-            "border-radius: 20px; padding: 60px;"
-        )
+        label.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout.addWidget(label)
 
     def activate(self) -> None:

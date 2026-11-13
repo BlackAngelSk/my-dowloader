@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
 )
 
 from omnidownloader.core.scheduler import SchedulerRule
+from omnidownloader.ui import icons, themes
 
 
 def _speed_to_display(bps: float) -> str:
@@ -46,16 +47,6 @@ class SchedulerPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(12)
 
-        title = QLabel("Bandwidth Scheduler Rules")
-        title.setObjectName("title")
-        root.addWidget(title)
-
-        desc = QLabel(
-            "Set time-based rules to automatically adjust download speed."
-        )
-        desc.setObjectName("muted")
-        desc.setWordWrap(True)
-        root.addWidget(desc)
 
         # Add new rule form
         add_group = QGroupBox("Add New Rule")
@@ -74,35 +65,43 @@ class SchedulerPanel(QWidget):
         # Time row
         time_form = QFormLayout()
         time_row = QHBoxLayout()
-        self._start_h = QSpinBox(); self._start_h.setRange(0, 23); self._start_h.setValue(2)
-        self._start_m = QSpinBox(); self._start_m.setRange(0, 59)
+        self._start_h = QSpinBox(); self._start_h.setRange(0, 23); self._start_h.setFixedWidth(70); self._start_h.setValue(2)
+        self._start_m = QSpinBox(); self._start_m.setRange(0, 59); self._start_m.setFixedWidth(70)
         time_row.addWidget(QLabel("H:")); time_row.addWidget(self._start_h)
+        time_row.addSpacing(4)
         time_row.addWidget(QLabel("M:")); time_row.addWidget(self._start_m)
+        time_row.addStretch()
         time_form.addRow("Start Time:", time_row)
         time_row2 = QHBoxLayout()
-        self._end_h = QSpinBox(); self._end_h.setRange(0, 23); self._end_h.setValue(8)
-        self._end_m = QSpinBox(); self._end_m.setRange(0, 59)
+        self._end_h = QSpinBox(); self._end_h.setRange(0, 23); self._end_h.setFixedWidth(70); self._end_h.setValue(8)
+        self._end_m = QSpinBox(); self._end_m.setRange(0, 59); self._end_m.setFixedWidth(70)
         time_row2.addWidget(QLabel("H:")); time_row2.addWidget(self._end_h)
+        time_row2.addSpacing(4)
         time_row2.addWidget(QLabel("M:")); time_row2.addWidget(self._end_m)
+        time_row2.addStretch()
         time_form.addRow("End Time:", time_row2)
         speed_row = QHBoxLayout()
         self._speed_input = QLineEdit()
+        self._speed_input.setMaximumWidth(140)
         self._speed_input.setPlaceholderText("0 = unlimited")
-        speed_row.addWidget(self._speed_input, 1)
+        speed_row.addWidget(self._speed_input)
         self._speed_unit = QComboBox()
         self._speed_unit.addItems(["MB/s", "KB/s", "B/s"])
         self._speed_unit.setCurrentText("MB/s")
+        self._speed_unit.setFixedWidth(92)
         speed_row.addWidget(self._speed_unit)
+        speed_row.addStretch()
         time_form.addRow("Speed Limit:", speed_row)
         add_outer.addLayout(time_form)
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
-        self._add_btn = QPushButton("+ Add Rule")
+        self._add_btn = QPushButton("  Add rule")
         self._add_btn.setObjectName("primaryButton")
+        self._add_btn.setIcon(icons.icon("plus", themes.current_palette().on_accent, 14))
         self._add_btn.clicked.connect(self._add_rule)
-        self._preset_btn = QPushButton("Load Night/Day Preset")
-        self._preset_btn.setObjectName("iconButton")
+        self._preset_btn = QPushButton("Load night/day preset")
+        self._preset_btn.setObjectName("ghostButton")
         self._preset_btn.clicked.connect(self._load_preset)
         btn_row.addWidget(self._preset_btn)
         btn_row.addWidget(self._add_btn)
@@ -117,16 +116,28 @@ class SchedulerPanel(QWidget):
         self._rules_layout.addWidget(self._empty_label)
         root.addWidget(self._rules_group)
 
-        self._active_lbl = QLabel("Active rule: None")
-        self._active_lbl.setStyleSheet("font-weight: bold; color: #14B8A6;")
-        root.addWidget(self._active_lbl)
+        self._active_lbl = QLabel("Active rule: none")
+        self._active_lbl.setObjectName("pill")
+        self._active_lbl.setProperty("tone", "idle")
+        active_row = QHBoxLayout()
+        active_row.addWidget(self._active_lbl)
+        active_row.addStretch()
+        root.addLayout(active_row)
         root.addStretch()
 
     def set_rules(self, rules: list) -> None:
         self._rules = list(rules)
         self._refresh_rules_list()
 
+    def _set_active_tone(self, active: bool) -> None:
+        self._active_lbl.setProperty("tone", "done" if active else "idle")
+        style = self._active_lbl.style()
+        if style is not None:
+            style.unpolish(self._active_lbl)
+            style.polish(self._active_lbl)
+
     def update_active_rule(self, name: str) -> None:
+        self._set_active_tone(bool(name))
         if name:
             self._active_lbl.setText(f"Active rule: {name}")
         else:

@@ -4,8 +4,10 @@ from __future__ import annotations
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
+
+from omnidownloader.ui import icons, themes
 
 class AnonymityPage(QWidget):
     proxy_config_changed = pyqtSignal(dict)
@@ -33,13 +35,36 @@ class AnonymityPage(QWidget):
         self.auto_proxy_found_ready.connect(self.update_auto_proxy_found)
 
     def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
+        # The page is taller than the window: without a scroll area Qt compressed
+        # the form rows until the labels and fields overlapped each other.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 20, 26, 16)
+        outer.setSpacing(14)
+
+        header = QVBoxLayout()
+        header.setSpacing(2)
+        title = QLabel("Anonymity")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(
+            "Proxy, Tor and the kill switch — what the outside world sees while you download.")
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
+        header.addWidget(title)
+        header.addWidget(subtitle)
+        outer.addLayout(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        root = QVBoxLayout(content)
+        root.setContentsMargins(0, 0, 6, 0)
+        root.setSpacing(14)
 
         # Status Card
         sg = QGroupBox("Connection Status")
         sl = QVBoxLayout()
-        self._ip_label = QLabel("⚪ Not checked yet")
+        self._ip_label = QLabel("Not checked yet")
         self._ip_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         sl.addWidget(self._ip_label)
         self._country_label = QLabel("")
@@ -49,12 +74,15 @@ class AnonymityPage(QWidget):
         self._latency_label.setObjectName("muted")
         sl.addWidget(self._latency_label)
         br = QHBoxLayout()
-        self._check_btn = QPushButton("🔄 Check IP Now")
+        self._check_btn = QPushButton("  Check IP now")
         self._check_btn.setObjectName("primaryButton")
+        self._check_btn.setIcon(
+            icons.icon("refresh", themes.current_palette().on_accent, 16))
         self._check_btn.clicked.connect(self.ip_check_requested.emit)
         br.addWidget(self._check_btn)
-        self._rotate_btn = QPushButton("🔄 New Tor Circuit")
-        self._rotate_btn.setObjectName("iconButton")
+        self._rotate_btn = QPushButton("  New Tor circuit")
+        self._rotate_btn.setObjectName("ghostButton")
+        self._rotate_btn.setIcon(icons.icon("shield", themes.current_palette().text_2, 16))
         self._rotate_btn.clicked.connect(self.tor_rotate_requested.emit)
         br.addWidget(self._rotate_btn)
         br.addStretch()
@@ -77,13 +105,15 @@ class AnonymityPage(QWidget):
         self._auto_btn.clicked.connect(self._on_auto_toggled)
         ar.addWidget(QLabel("Enable:"))
         ar.addWidget(self._auto_btn)
-        self._auto_find_btn = QPushButton("🔍 Find proxy now")
-        self._auto_find_btn.setObjectName("iconButton")
+        self._auto_find_btn = QPushButton("  Find proxy now")
+        self._auto_find_btn.setObjectName("ghostButton")
+        self._auto_find_btn.setIcon(
+            icons.icon("search", themes.current_palette().text_2, 16))
         self._auto_find_btn.clicked.connect(self.auto_proxy_find_now.emit)
         ar.addWidget(self._auto_find_btn)
         ar.addStretch()
         al.addLayout(ar)
-        self._auto_status = QLabel("⚪ Off — no proxy in use")
+        self._auto_status = QLabel("Off — no proxy in use")
         self._auto_status.setObjectName("subtitle")
         self._auto_status.setWordWrap(True)
         al.addWidget(self._auto_status)
@@ -109,6 +139,9 @@ class AnonymityPage(QWidget):
         self._proxy_pass = QLineEdit()
         self._proxy_pass.setPlaceholderText("optional")
         self._proxy_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        for field in (self._proxy_type, self._proxy_host, self._proxy_port,
+                      self._proxy_user, self._proxy_pass):
+            field.setMaximumWidth(340)
         pf.addRow("Enable:", self._proxy_enabled)
         pf.addRow("Type:", self._proxy_type)
         pf.addRow("Host:", self._proxy_host)
@@ -133,7 +166,7 @@ class AnonymityPage(QWidget):
         self._tor_btn.setCheckable(True)
         self._tor_btn.setFixedWidth(60)
         self._tor_btn.clicked.connect(self._on_tor_toggled)
-        self._tor_status = QLabel("⚪ Not running")
+        self._tor_status = QLabel("Not running")
         self._tor_status.setObjectName("subtitle")
         tf.addRow("Use Tor:", self._tor_btn)
         tf.addRow("Status:", self._tor_status)
@@ -147,7 +180,7 @@ class AnonymityPage(QWidget):
         self._kill_btn.setCheckable(True)
         self._kill_btn.setFixedWidth(60)
         self._kill_btn.clicked.connect(self._on_kill_toggled)
-        self._kill_status = QLabel("⚪ Inactive")
+        self._kill_status = QLabel("Inactive")
         self._kill_status.setObjectName("subtitle")
         self._kill_interval = QSpinBox()
         self._kill_interval.setRange(5, 300)
@@ -171,14 +204,16 @@ class AnonymityPage(QWidget):
         dg.setLayout(df)
         root.addWidget(dg)
         root.addStretch()
+        scroll.setWidget(content)
+        outer.addWidget(scroll, 1)
 
     def _on_auto_toggled(self):
         enabled = self._auto_btn.isChecked()
         self._auto_btn.setText("ON" if enabled else "OFF")
         self.set_auto_enabled_state(enabled)
         self._auto_status.setText(
-            "⏳ Searching for a working proxy…" if enabled
-            else "⚪ Off — no proxy in use"
+            "Searching for a working proxy…" if enabled
+            else "Off — no proxy in use"
         )
         self.auto_proxy_toggle.emit(enabled)
 
@@ -193,7 +228,7 @@ class AnonymityPage(QWidget):
                        self._proxy_user, self._proxy_pass, self._proxy_enabled):
             widget.setEnabled(not enabled)
         self._auto_find_btn.setText(
-            "🔍 Find another" if enabled else "🔍 Find proxy now"
+            "  Find another" if enabled else "  Find proxy now"
         )
 
     def update_auto_proxy_status(self, message: str):
@@ -202,7 +237,7 @@ class AnonymityPage(QWidget):
     def update_auto_proxy_found(self, url: str, label: str, latency: float, exit_ip: str):
         """Show the discovered proxy, and mirror it into the manual fields."""
         self._auto_status.setText(
-            f"✅ Using {label}  •  {latency:.0f} ms  •  exit {exit_ip or 'unknown'}"
+            f"Using {label}  •  {latency:.0f} ms  •  exit {exit_ip or 'unknown'}"
         )
         type_text = {"socks5": "SOCKS5", "socks4": "SOCKS4",
                      "http": "HTTP", "https": "HTTPS"}.get(
@@ -267,14 +302,14 @@ class AnonymityPage(QWidget):
 
     def update_tor_status(self, running, bootstrapped):
         if bootstrapped:
-            self._tor_status.setText("✅ Connected (3 hops)")
+            self._tor_status.setText("Connected (3 hops)")
         elif running:
-            self._tor_status.setText("⏳ Starting...")
+            self._tor_status.setText("Starting…")
         else:
-            self._tor_status.setText("⚪ Not running")
+            self._tor_status.setText("Not running")
 
     def update_kill_status(self, active):
-        self._kill_status.setText("✅ Active — monitoring" if active else "⚪ Inactive")
+        self._kill_status.setText("Active — monitoring" if active else "Inactive")
 
     @staticmethod
     def _country_flag(code):

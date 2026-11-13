@@ -17,6 +17,8 @@ from PyQt6.QtWidgets import (
     QPushButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from omnidownloader.ui import icons, themes
+
 logger = logging.getLogger(__name__)
 
 
@@ -208,8 +210,8 @@ class FormatItemWidget(QFrame):
         self._indicator.setFixedWidth(20)
         self._indicator.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._indicator.setStyleSheet(
-            "font-size: 16px; color: #3B82F6;" if is_default else "font-size: 16px;"
-        )
+            f"font-size: 16px; color: {themes.current_palette().accent};"
+            if is_default else "font-size: 16px;")
         layout.addWidget(self._indicator)
 
         lbl = QLabel(f"<b>{entry.label}</b>")
@@ -299,10 +301,13 @@ class FormatSelectionDialog(QDialog):
         # Header
         header = QHBoxLayout()
         header.setSpacing(12)
-        thumb = QLabel("🎬")
+        thumb = QLabel()
         thumb.setFixedSize(120, 68)
         thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        thumb.setStyleSheet("font-size: 28px; background-color: #111827; border-radius: 6px;")
+        _palette = themes.current_palette()
+        thumb.setPixmap(icons.pixmap("film", _palette.text_3, 26))
+        thumb.setStyleSheet(
+            f"background-color: {_palette.surface_2}; border-radius: 8px;")
         if self._metadata.get("thumbnail"):
             # Fetched on a worker thread: doing it inline blocked the whole UI
             # for up to 5 s whenever the CDN was slow.
@@ -335,8 +340,10 @@ class FormatSelectionDialog(QDialog):
         self._tabs = QTabWidget()
         self._video_tab = QWidget()
         self._audio_tab = QWidget()
-        self._tabs.addTab(self._video_tab, "🎬 Video")
-        self._tabs.addTab(self._audio_tab, "🎵 Audio")
+        self._tabs.addTab(self._video_tab,
+                          icons.icon("film", themes.current_palette().text_2, 15), "Video")
+        self._tabs.addTab(self._audio_tab,
+                          icons.icon("audio", themes.current_palette().text_2, 15), "Audio")
         self._video_list = QListWidget()
         self._video_list.setFrameShape(QListWidget.Shape.NoFrame)
         vlay = QVBoxLayout(self._video_tab)
@@ -374,7 +381,9 @@ class FormatSelectionDialog(QDialog):
         cancel_btn = QPushButton("Cancel")
         cancel_btn.setObjectName("iconButton")
         cancel_btn.clicked.connect(self.reject)
-        self._start_btn = QPushButton("⬇ Start Download")
+        self._start_btn = QPushButton("  Start download")
+        self._start_btn.setIcon(
+            icons.icon("download", themes.current_palette().on_accent, 16))
         self._start_btn.setObjectName("primaryButton")
         self._start_btn.clicked.connect(self._on_accept)
         self._start_btn.setEnabled(False)
@@ -440,7 +449,7 @@ class FormatSelectionDialog(QDialog):
             best = video_formats[0]
             self._add_format_item(self._video_list, best, is_default=True,
                                   format_id="bv*+ba/b",
-                                  label_override=f"⚡ Best Quality ({best.height}p)")
+                                  label_override=f"Best quality ({best.height}p)")
             for entry in video_formats:
                 fmt_str = f"{entry.format_id}+bestaudio/best"
                 self._add_format_item(self._video_list, entry, format_id=fmt_str)
@@ -453,7 +462,7 @@ class FormatSelectionDialog(QDialog):
             best_audio = audio_formats[0]
             self._add_format_item(self._audio_list, best_audio, is_default=True,
                                   format_id="bestaudio/best",
-                                  label_override="⚡ Best Audio",
+                                  label_override="Best audio",
                                   audio_only=True)
             for entry in audio_formats:
                 self._add_format_item(self._audio_list, entry,
@@ -471,7 +480,7 @@ class FormatSelectionDialog(QDialog):
             })
             self._add_format_item(self._audio_list, placeholder, is_default=True,
                                   format_id="bestaudio/best",
-                                  label_override="⚡ Best Audio (from this link)",
+                                  label_override="Best audio (from this link)",
                                   audio_only=True)
             self._add_empty_state(
                 self._audio_list,

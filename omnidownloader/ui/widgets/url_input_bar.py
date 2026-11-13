@@ -1,13 +1,14 @@
-"""Smart URL input bar with auto-detect, paste, and add button."""
+"""Command bar — paste a link, optionally with a checksum, and start it."""
 
 from __future__ import annotations
 
 import re
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QWidget
 
 from omnidownloader.core.url_utils import normalize_url
+from omnidownloader.ui import icons, themes
 
 #: "https://… sha256:abc…" — an expected digest typed after the URL.
 CHECKSUM_RE = re.compile(r"\b(sha256|sha512|sha1|md5):([0-9a-fA-F]{32,128})\b")
@@ -23,33 +24,49 @@ class URLInputBar(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(16, 8, 16, 8)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
         self._input = QLineEdit()
         self._input.setObjectName("urlInput")
         self._input.setPlaceholderText(
-            "Paste a URL — or prefix with 'scrape:' to extract images from any page"
+            "Paste a link — https:// is optional, or prefix with 'scrape:'"
         )
-        self._input.setMinimumHeight(44)
+        self._input.setMinimumHeight(46)
+        self._input.setClearButtonEnabled(True)
         self._input.returnPressed.connect(self._on_submit)
+        # Leading action = an icon inside the field, no extra widget/geometry.
+        self._lead_action = self._input.addAction(
+            icons.icon("download", themes.current_palette().text_3, 18),
+            QLineEdit.ActionPosition.LeadingPosition,
+        )
 
-        self._paste_btn = QPushButton("📋 Paste")
-        self._paste_btn.setObjectName("iconButton")
-        self._paste_btn.setFixedWidth(80)
-        self._paste_btn.setFixedHeight(44)
-        self._paste_btn.setToolTip("Paste from clipboard")
+        self._paste_btn = QPushButton("Paste")
+        self._paste_btn.setObjectName("ghostButton")
+        self._paste_btn.setMinimumHeight(46)
+        self._paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._paste_btn.setToolTip("Paste from the clipboard")
         self._paste_btn.clicked.connect(self._on_paste)
 
-        self._add_btn = QPushButton("＋ Add")
+        self._add_btn = QPushButton("Download")
         self._add_btn.setObjectName("primaryButton")
-        self._add_btn.setFixedWidth(100)
-        self._add_btn.setFixedHeight(44)
+        self._add_btn.setMinimumHeight(46)
+        self._add_btn.setMinimumWidth(126)
+        self._add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._add_btn.setIconSize(QSize(16, 16))
         self._add_btn.clicked.connect(self._on_submit)
 
         layout.addWidget(self._input, 1)
         layout.addWidget(self._paste_btn)
         layout.addWidget(self._add_btn)
+        self.apply_theme()
+
+    def apply_theme(self) -> None:
+        c = themes.current_palette()
+        if self._lead_action is not None:
+            self._lead_action.setIcon(icons.icon("download", c.text_3, 18))
+        self._paste_btn.setIcon(icons.icon("paste", c.text_2, 16))
+        self._add_btn.setIcon(icons.icon("plus", c.on_accent, 16))
 
     def set_url(self, url: str) -> None:
         self._input.setText(url)

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QHBoxLayout, QLabel, QScrollArea, QVBoxLayout, QWidget,
+)
 
 from omnidownloader.ui.widgets.scheduler_panel import SchedulerPanel
 
@@ -14,11 +16,31 @@ class SchedulerPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 16, 24, 16)
+        layout.setContentsMargins(26, 20, 26, 16)
+        layout.setSpacing(14)
+
+        header = QHBoxLayout()
+        titles = QVBoxLayout()
+        titles.setSpacing(2)
+        title = QLabel("Scheduler")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(
+            "Time-based rules that change the speed limit — for downloads you leave overnight.")
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        header.addLayout(titles)
+        header.addStretch()
+        layout.addLayout(header)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
         self._panel = SchedulerPanel()
         self._panel.rules_changed.connect(self.rules_changed.emit)
-        layout.addWidget(self._panel)
-        layout.addStretch()
+        scroll.setWidget(self._panel)
+        layout.addWidget(scroll, 1)
 
     def set_rules(self, rules) -> None:
         self._panel.set_rules(rules)

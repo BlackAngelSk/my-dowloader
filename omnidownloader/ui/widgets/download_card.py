@@ -1,18 +1,23 @@
-"""Download progress card widget."""
+"""Download card — one row per transfer, with the state legible at a glance."""
 
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+import os
+from pathlib import Path
+
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox, QFrame, QHBoxLayout, QLabel, QProgressBar, QPushButton,
     QSizePolicy, QVBoxLayout, QWidget,
 )
+
 from omnidownloader.core.models import DownloadJob, DownloadState, Priority
+from omnidownloader.ui import icons, themes
 
 
 def _fmt_speed(bps):
     if bps <= 0:
-        return "\u2014"
+        return "—"
     for u in ("B/s", "KB/s", "MB/s", "GB/s"):
         if bps < 1024:
             return f"{bps:.1f} {u}"
@@ -22,7 +27,7 @@ def _fmt_speed(bps):
 
 def _fmt_eta(s):
     if s is None or s <= 0:
-        return "\u2014"
+        return "—"
     if s < 60:
         return f"{int(s)}s"
     if s < 3600:
@@ -40,12 +45,28 @@ def _fmt_size(b):
     return f"{b:.1f} PB"
 
 
-_STATE_COLORS = {
-    DownloadState.PENDING: "#64748B", DownloadState.EXTRACTING: "#F59E0B",
-    DownloadState.DOWNLOADING: "#3B82F6", DownloadState.PAUSED: "#F59E0B",
-    DownloadState.MERGING: "#8B5CF6", DownloadState.COMPLETED: "#14B8A6",
-    DownloadState.FAILED: "#EF4444", DownloadState.CANCELLED: "#64748B",
+#: state → (label, pill tone, tile colour role)
+_STATE_STYLE = {
+    DownloadState.PENDING: ("Queued", "idle", "text_3"),
+    DownloadState.EXTRACTING: ("Preparing", "warn", "warning"),
+    DownloadState.DOWNLOADING: ("Downloading", "active", "accent"),
+    DownloadState.PAUSED: ("Paused", "warn", "warning"),
+    DownloadState.MERGING: ("Merging", "warn", "accent"),
+    DownloadState.COMPLETED: ("Done", "done", "success"),
+    DownloadState.FAILED: ("Failed", "error", "danger"),
+    DownloadState.CANCELLED: ("Cancelled", "idle", "text_3"),
 }
+
+
+def _tile_text(job: DownloadJob) -> str:
+    """A four-character file-type badge, the way a file manager shows it."""
+    name = job.file_name or Path(job.url.split("?")[0]).name
+    suffix = Path(name).suffix.lstrip(".").upper()
+    if job.url.startswith("magnet:"):
+        return "TOR"
+    if not suffix:
+        return "FILE"
+    return suffix[:4]
 
 
 class DownloadCard(QFrame):
@@ -60,123 +81,196 @@ class DownloadCard(QFrame):
     def __init__(self, job, parent=None):
         super().__init__(parent)
         self._job = job
+        self._full_title = job.file_name or job.url[:80]
         self.setObjectName("downloadCard")
         self.setFrameShape(QFrame.Shape.NoFrame)
-        self.setMinimumHeight(90)
+        self.setMinimumHeight(104)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._build_ui()
+        self.apply_theme()
+        self.update_progress()
 
     @property
     def job(self):
         return self._job
 
+    # ── construction ────────────────────────────────────────────
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(6)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(9)
+
+        # ── row 1: tile · title/subtitle · state · actions ──────
         row1 = QHBoxLayout()
-        row1.setSpacing(10)
-        self._dot = QLabel()
-        self._dot.setFixedSize(8, 8)
-        self._update_dot()
-        self._title = QLabel(self._job.file_name or self._job.url[:60])
-        self._title.setObjectName("title")
-        self._title.setWordWrap(True)
-        self._badge = QLabel(self._job.state.value.upper())
-        self._badge.setObjectName("muted")
-        self._badge.setFixedWidth(80)
-        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._pause_btn = QPushButton("\u23f8")
-        self._pause_btn.setObjectName("iconButton")
-        self._pause_btn.setFixedSize(32, 32)
-        # One button toggles both ways: it used to always emit pause_clicked,
-        # so a paused download could never be resumed from the card (the
-        # resume path's state guard made it a silent no-op).
-        self._pause_btn.clicked.connect(self._on_pause_or_resume)
-        self._cancel_btn = QPushButton("\u23f9")
-        self._cancel_btn.setObjectName("iconButton")
-        self._cancel_btn.setFixedSize(32, 32)
-        self._cancel_btn.clicked.connect(lambda: self.cancel_clicked.emit(self._job.id))
-        self._open_btn = QPushButton("\U0001f4c2")
-        self._open_btn.setObjectName("iconButton")
-        self._open_btn.setFixedSize(32, 32)
-        self._open_btn.clicked.connect(lambda: self.open_folder_clicked.emit(self._job.id))
-        self._preview_btn = QPushButton("\U0001f3ac")
-        self._preview_btn.setObjectName("iconButton")
-        self._preview_btn.setFixedSize(32, 32)
-        self._preview_btn.setToolTip("Preview media")
-        self._preview_btn.clicked.connect(lambda: self.preview_clicked.emit(self._job.id))
-        row1.addWidget(self._dot)
-        row1.addWidget(self._title, 1)
-        # Quality badge for media downloads
-        quality = self._job.metadata.get("quality_label", "")
+        row1.setSpacing(12)
+
+        self._tile = QLabel(_tile_text(self._job))
+        self._tile.setObjectName("fileTile")
+        self._tile.setFixedSize(42, 42)
+        self._tile.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row1.addWidget(self._tile, 0, Qt.AlignmentFlag.AlignTop)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        text_col.setContentsMargins(0, 1, 0, 0)
+        self._title = QLabel(self._full_title)
+        self._title.setObjectName("cardTitle")
+        self._title.setTextFormat(Qt.TextFormat.PlainText)
+        self._sub = QLabel(self._subtitle_text())
+        self._sub.setObjectName("cardSub")
+        text_col.addWidget(self._title)
+        text_col.addWidget(self._sub)
+        row1.addLayout(text_col, 1)
+
+        quality = str(self._job.metadata.get("quality_label", "") or "")
+        self._quality_badge = None
         if quality:
             self._quality_badge = QLabel(quality)
-            self._quality_badge.setStyleSheet(
-                "background-color: #3B82F6; color: white; border-radius: 4px; "
-                "padding: 2px 8px; font-size: 11px; font-weight: bold;"
-            )
-            self._quality_badge.setFixedWidth(50)
+            self._quality_badge.setObjectName("qualityPill")
             self._quality_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            row1.addWidget(self._quality_badge)
-        row1.addWidget(self._badge)
-        row1.addWidget(self._pause_btn)
-        row1.addWidget(self._cancel_btn)
-        row1.addWidget(self._open_btn)
-        row1.addWidget(self._preview_btn)
+            row1.addWidget(self._quality_badge, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._badge = QLabel("Queued")
+        self._badge.setObjectName("pill")
+        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        row1.addWidget(self._badge, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._pause_btn = self._action_button("pause", "Pause / resume")
+        self._pause_btn.clicked.connect(self._on_pause_or_resume)
+        self._cancel_btn = self._action_button("close", "Remove the download")
+        self._cancel_btn.clicked.connect(
+            lambda: self.cancel_clicked.emit(self._job.id))
+        self._open_btn = self._action_button("folder", "Show in folder")
+        self._open_btn.clicked.connect(
+            lambda: self.open_folder_clicked.emit(self._job.id))
+        self._preview_btn = self._action_button("film", "Preview while downloading")
+        self._preview_btn.clicked.connect(
+            lambda: self.preview_clicked.emit(self._job.id))
+        for btn in (self._pause_btn, self._preview_btn,
+                    self._open_btn, self._cancel_btn):
+            row1.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        root.addLayout(row1)
+
+        # ── row 2: progress · percent ───────────────────────────
+        row2 = QHBoxLayout()
+        row2.setSpacing(10)
+        row2.setContentsMargins(0, 0, 0, 0)
         self._bar = QProgressBar()
+        self._bar.setObjectName("cardProgress")
         self._bar.setRange(0, 1000)
         self._bar.setValue(0)
-        self._bar.setFixedHeight(8)
+        self._bar.setFixedHeight(6)
         self._bar.setTextVisible(False)
-        row3 = QHBoxLayout()
-        self._speed_lbl = QLabel("\u2014")
-        self._speed_lbl.setObjectName("muted")
-        self._size_lbl = QLabel("0 / ?")
-        self._size_lbl.setObjectName("muted")
-        self._eta_lbl = QLabel("ETA: \u2014")
-        self._eta_lbl.setObjectName("muted")
-        row3.addWidget(self._speed_lbl)
-        row3.addWidget(self._size_lbl)
-        row3.addStretch()
-        row3.addWidget(self._eta_lbl)
-        root.addLayout(row1)
-        root.addWidget(self._bar)
+        self._bar.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                QSizePolicy.Policy.Fixed)
+        self._percent = QLabel("0%")
+        self._percent.setObjectName("cardPercent")
+        self._percent.setFixedWidth(40)
+        self._percent.setAlignment(Qt.AlignmentFlag.AlignRight
+                                   | Qt.AlignmentFlag.AlignVCenter)
+        row2.addWidget(self._bar, 1)
+        row2.addWidget(self._percent, 0)
+        root.addLayout(row2)
 
-        # Priority & sequential row
-        opt_row = QHBoxLayout()
+        # ── row 3: meta · priority · sequential ─────────────────
+        row3 = QHBoxLayout()
+        row3.setSpacing(8)
+        self._speed_lbl = QLabel("—")
+        self._speed_lbl.setObjectName("cardMeta")
+        self._size_lbl = QLabel("0 / ?")
+        self._size_lbl.setObjectName("cardMeta")
+        self._eta_lbl = QLabel("ETA —")
+        self._eta_lbl.setObjectName("cardMeta")
+        for label in (self._speed_lbl, self._size_lbl, self._eta_lbl):
+            label.setMinimumWidth(0)
+        row3.addWidget(self._speed_lbl)
+        row3.addWidget(self._dot_separator())
+        row3.addWidget(self._size_lbl)
+        row3.addWidget(self._dot_separator())
+        row3.addWidget(self._eta_lbl)
+        row3.addStretch()
+
         self._priority_combo = QComboBox()
         self._priority_combo.addItems(["High", "Normal", "Low"])
         self._priority_combo.setCurrentText(self._job.priority.value.capitalize())
-        self._priority_combo.setFixedWidth(100)
+        self._priority_combo.setFixedWidth(88)
+        self._priority_combo.setFixedHeight(26)
+        self._priority_combo.setToolTip("Priority in the queue")
         self._priority_combo.currentTextChanged.connect(self._on_priority_changed)
-        opt_row.addWidget(QLabel("Priority:"))
-        opt_row.addWidget(self._priority_combo)
+        row3.addWidget(self._priority_combo)
+
         self._seq_btn = QPushButton("Sequential")
-        self._seq_btn.setObjectName("iconButton")
+        self._seq_btn.setObjectName("filterChip")
         self._seq_btn.setCheckable(True)
         self._seq_btn.setChecked(self._job.sequential)
+        self._seq_btn.setFixedHeight(26)
+        self._seq_btn.setToolTip("Fetch the pieces in file order (streaming)")
         self._seq_btn.clicked.connect(self._on_sequential_toggled)
-        opt_row.addWidget(self._seq_btn)
-        opt_row.addStretch()
-        root.addLayout(opt_row)
-
+        row3.addWidget(self._seq_btn)
         root.addLayout(row3)
 
-    def _update_dot(self):
-        c = _STATE_COLORS.get(self._job.state, "#64748B")
-        self._dot.setStyleSheet(f"background-color: {c}; border-radius: 4px;")
+    @staticmethod
+    def _dot_separator() -> QLabel:
+        label = QLabel("·")
+        label.setObjectName("muted")
+        label.setFixedWidth(8)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        return label
+
+    def _action_button(self, glyph: str, tooltip: str) -> QPushButton:
+        btn = QPushButton()
+        btn.setObjectName("cardAction")
+        btn.setFixedSize(QSize(30, 30))
+        btn.setToolTip(tooltip)
+        btn.setProperty("glyph", glyph)
+        btn.setIconSize(QSize(16, 16))
+        return btn
+
+    # ── theming ─────────────────────────────────────────────────
+    def apply_theme(self) -> None:
+        """Re-tint the painted icons and the file tile for the current theme."""
+        c = themes.current_palette()
+        state_style = _STATE_STYLE.get(self._job.state, ("", "idle", "text_3"))
+        tile_color = getattr(c, state_style[2], c.text_2)
+        soft = getattr(c, f"{state_style[2]}_soft", None)
+        if soft is None:
+            soft = c.surface_3
+        self._tile.setStyleSheet(
+            f"background-color: {soft}; color: {tile_color};"
+            " border-radius: 10px; font-size: 9px; font-weight: 700;"
+        )
+        paused = self._job.state == DownloadState.PAUSED
+        glyphs = {
+            self._pause_btn: ("play" if paused else "pause", c.text_2),
+            self._cancel_btn: ("close", c.text_3),
+            self._open_btn: ("folder", c.text_2),
+            self._preview_btn: ("film", c.text_2),
+        }
+        for btn, (name, color) in glyphs.items():
+            enabled = btn.isEnabled()
+            btn.setIcon(icons.icon(name, color if enabled else c.text_3, 16))
+
+    # ── text helpers ────────────────────────────────────────────
+    def _subtitle_text(self) -> str:
+        j = self._job
+        if j.state == DownloadState.FAILED and j.error_message:
+            return j.error_message[:120]
+        host = ""
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(j.url).hostname or ""
+        except Exception:  # noqa: BLE001
+            host = ""
+        if not host and j.url.startswith("magnet:"):
+            host = "torrent"
+        parts = [p for p in (host, Path(j.file_path).parent.name if j.file_path else "") if p]
+        return " · ".join(parts) or j.url[:80]
 
     def _size_text(self, j) -> str:
-        """``done / total`` line, using the size the quality dialog estimated.
-
-        yt-dlp only reports the real size once its progress lines start, so a
-        media job used to sit at "? / ?" for the first seconds.  The dialog now
-        stores ``estimated_size`` on the job; show it (marked with ≈) until the
-        real byte count arrives.
-        """
+        """``done / total`` line, using the size the quality dialog estimated."""
         if j.file_size > 0:
-            return f"{_fmt_size(j.downloaded_bytes)} / {_fmt_size(j.file_size)}"
+            return f"{_fmt_size(j.downloaded_bytes)} of {_fmt_size(j.file_size)}"
         est = 0
         if isinstance(j.metadata, dict):
             try:
@@ -185,44 +279,70 @@ class DownloadCard(QFrame):
                 est = 0
         if est > 0 and j.state in (DownloadState.PENDING, DownloadState.EXTRACTING,
                                    DownloadState.DOWNLOADING, DownloadState.PAUSED):
-            # Show bytes downloaded against the estimate, not the "?"
-            # placeholder a zero file_size produces.
             done = _fmt_size(j.downloaded_bytes) if j.downloaded_bytes > 0 else "0 B"
-            return f"{done} / ≈{_fmt_size(est)}"
-        return f"{_fmt_size(j.downloaded_bytes)} / {_fmt_size(j.file_size)}"
+            return f"{done} of ≈{_fmt_size(est)}"
+        return f"{_fmt_size(j.downloaded_bytes)} of {_fmt_size(j.file_size)}"
 
+    def _elide_title(self) -> None:
+        full = self._job.file_name or self._job.url[:80]
+        budget = max(180, self.width() - 330)
+        self._title.setText(self._title.fontMetrics().elidedText(
+            full, Qt.TextElideMode.ElideMiddle, budget))
+
+    # ── state ───────────────────────────────────────────────────
     def update_progress(self):
         j = self._job
-        self._update_dot()
-        self._badge.setText(j.state.value.upper())
-        # Show error message on failed jobs
-        if j.state == DownloadState.FAILED and j.error_message:
-            self._title.setText(f"❌ {j.error_message[:80]}")
-        else:
-            self._title.setText(j.file_name or j.url[:60])
+        self._full_title = j.file_name or j.url[:80]
+        self._elide_title()
+        self._sub.setText(self._subtitle_text())
+        c = themes.current_palette()
+        self._sub.setStyleSheet(
+            f"color: {c.danger};" if j.state == DownloadState.FAILED else "")
+
+        label, tone, _tile_role = _STATE_STYLE.get(
+            j.state, (j.state.value.title(), "idle", "text_3"))
+        self._badge.setText(label)
+        # A dynamic property drives the QSS pill colour, so it must be
+        # re-polished to take effect.
+        self._badge.setProperty("tone", tone)
+        style = self._badge.style()
+        if style is not None:
+            style.unpolish(self._badge)
+            style.polish(self._badge)
+
         self._bar.setValue(int(j.progress_percent * 10))
+        self._percent.setText(f"{j.progress_percent:.0f}%")
         self._speed_lbl.setText(_fmt_speed(j.speed_bps))
         self._size_lbl.setText(self._size_text(j))
-        # A torrent that is waiting for peers/seeders has no ETA and no speed:
-        # showing "ETA: —" at a frozen 0% is what made a dead torrent look like
-        # a broken app.  The module sets status_note while it waits.
+
+        # A torrent that is waiting for peers has no ETA and no speed: the
+        # module's status_note says what it is doing instead.
         note = j.metadata.get("status_note") if isinstance(j.metadata, dict) else None
         if note and j.state in (DownloadState.DOWNLOADING, DownloadState.EXTRACTING):
             self._eta_lbl.setText(str(note)[:60])
+        elif j.state == DownloadState.COMPLETED:
+            self._eta_lbl.setText("complete")
+        elif j.state == DownloadState.PENDING:
+            self._eta_lbl.setText("waiting")
         else:
-            self._eta_lbl.setText(f"ETA: {_fmt_eta(j.eta_seconds)}")
-        active = j.state in (DownloadState.DOWNLOADING, DownloadState.EXTRACTING)
+            self._eta_lbl.setText(f"ETA {_fmt_eta(j.eta_seconds)}")
+
+        active = j.state in (DownloadState.DOWNLOADING, DownloadState.EXTRACTING,
+                             DownloadState.MERGING)
         paused = j.state == DownloadState.PAUSED
-        self._pause_btn.setText("\u25b6" if paused else "\u23f8")
         self._pause_btn.setEnabled(active or paused)
         self._cancel_btn.setEnabled(active or paused or j.state == DownloadState.PENDING)
         self._open_btn.setEnabled(j.state == DownloadState.COMPLETED)
-        # Media jobs never get a StreamingBuffer (yt-dlp owns the file), so
-        # requiring one disabled Preview for exactly the content it is for.
         self._preview_btn.setEnabled(
-            j.state in (DownloadState.DOWNLOADING, DownloadState.COMPLETED)
-        )
+            j.state in (DownloadState.DOWNLOADING, DownloadState.COMPLETED))
+        self._pause_btn.setToolTip("Resume" if paused else "Pause")
+        self.apply_theme()
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._elide_title()
+
+    # ── slots ───────────────────────────────────────────────────
     def _on_pause_or_resume(self) -> None:
         if self._job.state == DownloadState.PAUSED:
             self.resume_clicked.emit(self._job.id)
@@ -230,10 +350,8 @@ class DownloadCard(QFrame):
             self.pause_clicked.emit(self._job.id)
 
     def _on_priority_changed(self, text: str) -> None:
-        val = text.lower()
-        self.priority_changed.emit(self._job.id, val)
+        self.priority_changed.emit(self._job.id, text.lower())
 
     def _on_sequential_toggled(self, checked: bool) -> None:
         self._job.sequential = checked
         self.sequential_toggled.emit(self._job.id, checked)
-

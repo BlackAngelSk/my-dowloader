@@ -24,8 +24,11 @@ class SettingsPanel(QWidget):
         root.setSpacing(16)
 
         title = QLabel("Settings")
-        title.setObjectName("title")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel("Where files go, how many connections to use, and how the app behaves.")
+        subtitle.setObjectName("pageSubtitle")
         root.addWidget(title)
+        root.addWidget(subtitle)
 
         # ── Downloads group ──────────────────────────────────
         dl_group = QGroupBox("Downloads")

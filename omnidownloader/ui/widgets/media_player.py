@@ -13,6 +13,7 @@ from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QPixmap
+from omnidownloader.ui import themes
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy,
     QVBoxLayout, QWidget,
@@ -77,8 +78,10 @@ class MediaPreviewWidget(QFrame):
         self._player_area = QLabel("Select a download to preview")
         self._player_area.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._player_area.setMinimumHeight(160)
+        _palette = themes.current_palette()
         self._player_area.setStyleSheet(
-            "background-color: #111827; border-radius: 8px; color: #94A3B8;"
+            f"background-color: {_palette.stage}; border-radius: 10px;"
+            f" color: {_palette.text_3};"
         )
         root.addWidget(self._player_area, 1)
 
