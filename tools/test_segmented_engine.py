@@ -320,10 +320,43 @@ async def test_unchanged_file_still_resumes(tmp: Path, base: str) -> None:
         restore_engine(saved)
 
 
+def test_resume_state_of_a_split_piece() -> None:
+    """A piece truncated by a re-split must keep its bytes on the next run."""
+    from omnidownloader.core.models import SegmentProgress
+
+    dl = HTTPDownloader()
+    job = DownloadJob(url="http://example.invalid/x", file_path="/tmp/none")
+    # Session 1 recorded a piece of [0, 200) holding 60 bytes; session 1 then
+    # re-split it, so the planned piece for this run is the full [0, 1000).
+    state = {"segments": [{"segment_index": 0, "start_byte": 0,
+                           "end_byte": 199, "downloaded_bytes": 60}]}
+    segments = [SegmentProgress(0, 0, 999), SegmentProgress(1, 1000, 1999)]
+    resumed, done = dl._resume_segments(job, segments, state)
+    check("re-split piece keeps the bytes it already stored", done == 60, f"{done}")
+    check("the piece resumes at the stored offset",
+          resumed[0].downloaded_bytes == 60, str(resumed[0].downloaded_bytes))
+    check("a piece with no recorded state starts from zero",
+          resumed[1].downloaded_bytes == 0)
+
+    # A shrink (the piece is smaller now) must clamp, never overstate progress.
+    state2 = {"segments": [{"segment_index": 0, "start_byte": 0,
+                            "end_byte": 999, "downloaded_bytes": 900}]}
+    resumed2, done2 = dl._resume_segments(
+        job, [SegmentProgress(0, 0, 99)], state2)
+    check("progress beyond a shrunken piece is clamped", done2 == 100, str(done2))
+
+    # A different layout (start byte does not match) must not be reused.
+    state3 = {"segments": [{"segment_index": 0, "start_byte": 512,
+                            "end_byte": 1023, "downloaded_bytes": 512}]}
+    _resumed3, done3 = dl._resume_segments(job, [SegmentProgress(0, 0, 511)], state3)
+    check("a layout change is not resumed into", done3 == 0, str(done3))
+
+
 async def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="engine-test-"))
     runner, base = await start_server()
     try:
+        test_resume_state_of_a_split_piece()
         await test_stall_is_re_shared(tmp, base)
         await test_retry_on_503(tmp, base)
         await test_changed_file_is_not_resumed(tmp, base)

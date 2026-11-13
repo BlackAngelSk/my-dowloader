@@ -228,7 +228,13 @@ class HTTPDownloader(BaseDownloaderModule):
         resumed: list[SegmentProgress] = []
         for seg in segments:
             old = recorded.get(seg.segment_index)
-            if not old or old.get("start_byte") != seg.start_byte or old.get("end_byte") != seg.end_byte:
+            # The start byte is the identity that matters: pieces are planned
+            # deterministically, and a piece that was re-split in an earlier
+            # session comes back with a *different end* (the split truncated it)
+            # but the same start.  Requiring both to match threw away progress
+            # that was already on disk; the recorded prefix is still valid, so
+            # only the start has to agree, and `done` is clamped to the length.
+            if not old or old.get("start_byte") != seg.start_byte:
                 resumed.append(seg)
                 continue
             length = seg.end_byte - seg.start_byte + 1
