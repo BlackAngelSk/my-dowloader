@@ -55,6 +55,18 @@ class SegmentProgress:
     speed_bps: float = 0.0
     completed: bool = False
 
+    @property
+    def length(self) -> int:
+        """Bytes covered (0 for an unknown-size stream or a retired segment)."""
+        if self.end_byte < 0:
+            return 0
+        return max(0, self.end_byte - self.start_byte + 1)
+
+    @property
+    def remaining(self) -> int:
+        """Bytes still to fetch for this segment."""
+        return max(0, self.length - self.downloaded_bytes)
+
 
 @dataclass
 class DownloadJob:

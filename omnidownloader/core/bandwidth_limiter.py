@@ -186,6 +186,17 @@ class BandwidthManager:
     def remove_task_limiter(self, job_id: str) -> None:
         self._task_limiters.pop(job_id, None)
 
+    def is_limited(self, job_id: str) -> bool:
+        """True when *job_id* is capped (its pieces move slowly on purpose).
+
+        The stall watchdog must not mistake a throttled connection for a dead
+        one: at 20 KB/s a 256 KiB piece looks frozen for more than ten seconds.
+        """
+        bucket = self._task_limiters.get(job_id)
+        if bucket is not None and not bucket.is_unlimited:
+            return True
+        return not self._global.is_unlimited
+
     async def throttle_task(self, job_id: str, byte_count: int) -> None:
         bucket = self._task_limiters.get(job_id)
         if bucket:

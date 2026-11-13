@@ -23,7 +23,8 @@
 - 📂 **Drag & Drop** — Drop .torrent files, or text files containing a list of links
 - 🩺 **Diagnostics** — `python -m omnidownloader --diagnose [--download]` measures a real end-to-end download and reports what is broken
 - 🖥️ **Linux, macOS and Windows** — one code path, with the OS differences confined to `core/platform_utils.py`
-- ⚡ **Performance** — RAM ring buffer (16–64 MB), disk pre-allocation, async I/O, dynamic thread allocation
+- ⚡ **Performance** — a pool of connections that share the work (a free one takes the
+  largest remaining piece), RAM ring buffer (16–64 MB), disk pre-allocation, async I/O
 
 ## Architecture
 
@@ -37,6 +38,7 @@ omnidownloader/
 │   ├── download_manager.py    # Queue scheduler, speed limiter, signals
 │   ├── platform_utils.py      # The only place that talks to the OS
 │   ├── ram_buffer.py          # Ring buffer + positional disk flush
+│   ├── segment_planner.py     # Work-stealing piece planning for the pool
 │   ├── disk_utils.py          # Pre-allocation, checksums, resume sidecar
 │   └── scheduler.py           # Time-of-day rules
 ├── modules/
@@ -123,6 +125,35 @@ The app downloads and unpacks yt-dlp and ffmpeg itself if they are missing
 (including the right CPU architecture — arm64 builds on Apple silicon and
 Raspberry Pi), and keeps yt-dlp up to date.
 
+## Download engine
+
+The HTTP engine splits a file into **four times as many pieces as there are
+connections** and lets each free connection take the largest piece still going
+(the idea comes from [Mister Download Manager](https://github.com/anefzaoui/misterdownloadmanager)'s
+planner).  Three things follow from that:
+
+- **The tail is shared.**  The last piece is never left to one connection while
+  the others idle — a per-connection cap is spread over the whole file instead
+  of deciding who finishes last.
+- **A stalled connection loses its piece.**  If a piece moves no bytes for 15 s
+  while the rest of the job is still transferring, its connection is dropped,
+  the bytes already on disk are kept, and the remainder is re-split for the
+  pool.  If *nothing* moves for 30 s the job fails with a message instead of
+  hanging forever.
+- **Every piece retries from where it stopped.**  A reset connection, a 429/503
+  (honouring `Retry-After`) or a body cut short is retried — four attempts with
+  exponential backoff — and the resume point is the last byte stored, never the
+  start of the piece.
+
+Resume state is protected against a file that changed on the server: the ETag /
+Last-Modified seen at probe time goes into the sidecar and back out as
+`If-Range`, so a replaced file is downloaded again rather than mixed with the
+half you already had.
+
+Measured with `tools/bench_segmented.py` (local server, 2 MB/s cap per
+connection, 25 MB file): **1 connection 12.4 s, pool of 8 1.5 s — 8.1×**, same
+bytes.
+
 ## Usage
 
 ```bash
@@ -199,6 +230,9 @@ Note that built-ins are *imported*, so packaging them into a frozen bundle (see
 ```bash
 .venv/bin/python tools/test_routing.py            # URL → module routing
 .venv/bin/python tools/test_http_downloader.py    # segmented engine, resume, checksums
+.venv/bin/python tools/test_segment_planner.py    # piece grid + work stealing (pure)
+.venv/bin/python tools/test_segmented_engine.py   # stall re-split, retries, changed file
+.venv/bin/python tools/bench_segmented.py         # pool vs single connection, byte-exact
 .venv/bin/python tools/test_media_extractor.py    # live YouTube download
 .venv/bin/python tools/test_playlists.py          # playlist → child jobs
 .venv/bin/python tools/test_persistence.py        # config + history
